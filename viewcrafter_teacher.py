@@ -281,6 +281,18 @@ def pil_to_tensor(image, device):
     return torch.from_numpy(array).permute(2, 0, 1).to(device)
 
 
+def load_teacher_exact(path, camera, device):
+    with Image.open(path) as image:
+        image = image.convert("RGB")
+        expected = (camera.image_width, camera.image_height)
+        if image.size != expected:
+            raise RuntimeError(
+                f"Teacher {path} has size {image.size}; calibrated camera "
+                f"expects {expected}. Refusing to resize teacher supervision."
+            )
+        return pil_to_tensor(image, device)
+
+
 class ViewCrafterTeacherDataset:
     def __init__(self, cache_dir, device="cuda"):
         cache_dir = Path(cache_dir)
@@ -315,13 +327,7 @@ class ViewCrafterTeacherDataset:
 
     def __getitem__(self, index):
         camera, path, _ = self.pairs[index]
-        with Image.open(path) as image:
-            image = image.convert("RGB").resize(
-                (camera.image_width, camera.image_height),
-                Image.Resampling.LANCZOS,
-            )
-            tensor = pil_to_tensor(image, self.device)
-        return camera, tensor
+        return camera, load_teacher_exact(path, camera, self.device)
 
     def sample(self):
         index = torch.randint(0, len(self.pairs), (1,)).item()
@@ -329,13 +335,7 @@ class ViewCrafterTeacherDataset:
 
     def _load_item(self, item):
         camera, path, _ = item
-        with Image.open(path) as image:
-            image = image.convert("RGB").resize(
-                (camera.image_width, camera.image_height),
-                Image.Resampling.LANCZOS,
-            )
-            tensor = pil_to_tensor(image, self.device)
-        return camera, tensor
+        return camera, load_teacher_exact(path, camera, self.device)
 
     def sample_adjacent(self):
         index = torch.randint(0, len(self.adjacent_pairs), (1,)).item()

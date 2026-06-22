@@ -145,6 +145,11 @@ python Gauss_Code/run_pipeline.py \
 This produces `comparison_summary_512.json` containing Stage-1 and distillation
 PSNR, SSIM, and LPIPS for `shared_mlp` and `all`.
 
+The 200-iteration experiment is a plumbing and early-trend test only. It is
+not evidence of converged reconstruction quality. Use it to catch divergence,
+miscalibration, or a consistently harmful teacher signal before committing to
+full-length runs.
+
 To evaluate ViewCrafter's sparse-view-specific 576x1024 checkpoint, place it
 at `checkpoints/model_sparse.ckpt` and rerun into a separate output directory:
 
@@ -163,3 +168,13 @@ python Gauss_Code/run_pipeline.py \
 The second command reuses the exact Stage-1 checkpoint while keeping the
 teacher caches, distillation outputs, and `comparison_summary_sparse.json`
 separate by ViewCrafter profile.
+
+The cache validator prints the maximum principal-point deviation in pixels and
+as a percentage of image size. Teacher images must exactly match the calibrated
+render resolution; distillation refuses to resize them.
+
+The sparse profile is likely too large for some 20 GiB GPUs. Generated clips
+are moved to CPU immediately so multiple clips do not accumulate in GPU
+memory, but this cannot reduce the peak memory of the model plus one active
+25-frame clip. Do not reduce `video_length` without first confirming that the
+chosen checkpoint and configuration support a different temporal length.

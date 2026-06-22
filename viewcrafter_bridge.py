@@ -232,7 +232,13 @@ def main():
             for clip_index in range(len(self.img_ori) - 1):
                 start = clip_index * (self.opts.video_length - 1)
                 clip = renderings[start:start + self.opts.video_length]
-                clips.append(self.run_diffusion(clip))
+                # Keep only the active diffusion clip on the GPU. This does
+                # not reduce the model's peak VRAM, but prevents completed
+                # sparse-profile clips from accumulating there.
+                generated = self.run_diffusion(clip).detach().cpu()
+                clips.append(generated)
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
             return (
                 clips,
                 c2ws,
@@ -262,6 +268,23 @@ def main():
     opts.prompt = args.prompt
     opts.perframe_ae = True
     Path(opts.save_dir).mkdir(parents=True, exist_ok=True)
+
+    if torch.cuda.is_available():
+        device_index = torch.cuda.current_device()
+        total_vram_gb = (
+            torch.cuda.get_device_properties(device_index).total_memory
+            / (1024 ** 3)
+        )
+        print(
+            f"ViewCrafter profile={expected_name}, output={width}x{height}, "
+            f"GPU VRAM={total_vram_gb:.1f} GiB."
+        )
+        if expected_name == "ViewCrafter_25_sparse" and total_vram_gb < 24:
+            print(
+                "WARNING: sparse 1024-profile inference may exceed available "
+                "VRAM. Clips are retained on CPU after generation, but peak "
+                "model/active-clip memory is unchanged."
+            )
 
     model = ScaffoldViewCrafter(opts)
     (

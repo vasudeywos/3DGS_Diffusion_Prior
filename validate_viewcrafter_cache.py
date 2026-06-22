@@ -45,6 +45,7 @@ def main():
         )
 
     maximum_principal_offset = 0.0
+    maximum_principal_offset_pixels = 0.0
     for metadata_path in metadata_paths:
         record = json.loads(metadata_path.read_text())
         missing = [key for key in REQUIRED_INTRINSICS if key not in record]
@@ -73,7 +74,14 @@ def main():
             abs(cx - width / 2.0) / width,
             abs(cy - height / 2.0) / height,
         )
+        offset_pixels = max(
+            abs(cx - width / 2.0),
+            abs(cy - height / 2.0),
+        )
         maximum_principal_offset = max(maximum_principal_offset, offset)
+        maximum_principal_offset_pixels = max(
+            maximum_principal_offset_pixels, offset_pixels
+        )
 
     minimum = int(job["frame_filter"]["minimum_total_teachers"])
     if expected < minimum:
@@ -82,9 +90,15 @@ def main():
     print(
         f"Validated {expected} calibrated teachers at "
         f"{job['resolution'][1]}x{job['resolution'][0]}. "
-        f"Maximum normalized principal-point offset: "
-        f"{maximum_principal_offset:.6f}"
+        f"Maximum principal-point offset: "
+        f"{maximum_principal_offset_pixels:.3f}px "
+        f"({100.0 * maximum_principal_offset:.3f}% of image dimension)."
     )
+    if maximum_principal_offset > 0.01:
+        print(
+            "WARNING: principal-point offset exceeds 1%. The calibrated "
+            "off-center projection is enabled; inspect teacher/render overlays."
+        )
 
 
 if __name__ == "__main__":
