@@ -36,6 +36,9 @@ def main():
         raise RuntimeError("Generation result does not match the current job.")
     if complete.get("intrinsics_source") != "viewcrafter_pytorch3d_trajectory":
         raise RuntimeError("Teacher cache does not contain calibrated trajectory intrinsics.")
+    pose_source = complete.get("teacher_pose_source")
+    if pose_source not in {"scaffold", "dust3r"}:
+        raise RuntimeError("Teacher cache does not declare a valid pose source.")
 
     metadata_paths = sorted((cache_dir / "metadata").glob("*.json"))
     expected = int(complete["teacher_count"])
@@ -83,7 +86,12 @@ def main():
             maximum_principal_offset_pixels, offset_pixels
         )
 
-    minimum = int(job["frame_filter"]["minimum_total_teachers"])
+    configured_cap = int(complete.get("max_total_teachers", 0))
+    minimum = (
+        min(2, configured_cap)
+        if configured_cap > 0
+        else int(job["frame_filter"]["minimum_total_teachers"])
+    )
     if expected < minimum:
         raise RuntimeError(f"Only {expected} teachers were exported; need {minimum}.")
 
@@ -92,7 +100,8 @@ def main():
         f"{job['resolution'][1]}x{job['resolution'][0]}. "
         f"Maximum principal-point offset: "
         f"{maximum_principal_offset_pixels:.3f}px "
-        f"({100.0 * maximum_principal_offset:.3f}% of image dimension)."
+        f"({100.0 * maximum_principal_offset:.3f}% of image dimension). "
+        f"Pose source: {pose_source}."
     )
     if maximum_principal_offset > 0.01:
         print(

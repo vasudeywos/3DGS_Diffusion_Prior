@@ -98,12 +98,19 @@ def main():
     parser.add_argument("--viewcrafter_ddim_steps", type=int, default=50)
     parser.add_argument("--viewcrafter_bg_trd", type=float, default=0.2)
     parser.add_argument("--viewcrafter_render_chunk_size", type=int, default=4)
+    parser.add_argument("--viewcrafter_max_total_teachers", type=int, default=0)
+    parser.add_argument(
+        "--viewcrafter_teacher_pose_source",
+        choices=["scaffold", "dust3r"],
+        default="scaffold",
+    )
     parser.add_argument(
         "--viewcrafter_max_alignment_error", type=float, default=0.15
     )
     parser.add_argument("--viewcrafter_seed", type=int, default=123)
     parser.add_argument("--skip_viewcrafter", action="store_true")
     parser.add_argument("--lambda_teacher", type=float, default=0.2)
+    parser.add_argument("--lambda_teacher_l1", type=float, default=1.0)
     parser.add_argument("--lambda_lpips", type=float, default=0.1)
     parser.add_argument("--lambda_trajectory", type=float, default=0.03)
     parser.add_argument("--lambda_anchor_reg", type=float, default=0.01)
@@ -133,11 +140,25 @@ def main():
         action="store_true",
         help="Run a 200-iteration Stage-1 + shared_mlp/all sanity comparison.",
     )
+    parser.add_argument(
+        "--weak_prior_exploratory",
+        action="store_true",
+        help=(
+            "Run matched real-only and shared-MLP weak-prior controls with "
+            "8-12 globally selected teachers and LPIPS-dominant supervision."
+        ),
+    )
     args = parser.parse_args()
     if args.sanity_200:
         args.stage1_iterations = 200
         args.distill_iterations = 200
         args.compare_parameter_modes = True
+    if args.weak_prior_exploratory:
+        args.stage1_iterations = 200
+        args.distill_iterations = 200
+        args.viewcrafter_max_total_teachers = (
+            args.viewcrafter_max_total_teachers or 12
+        )
     if args.compare_parameter_modes and args.enable_densification_phase:
         raise ValueError(
             "--compare_parameter_modes cannot be combined with the optional "
@@ -306,6 +327,10 @@ def main():
             "--bg_trd", str(args.viewcrafter_bg_trd),
             "--render_chunk_size",
             str(args.viewcrafter_render_chunk_size),
+            "--teacher_pose_source",
+            args.viewcrafter_teacher_pose_source,
+            "--max_total_teachers",
+            str(args.viewcrafter_max_total_teachers),
             "--max_alignment_error",
             str(args.viewcrafter_max_alignment_error),
         ]
@@ -331,23 +356,59 @@ def main():
     if args.start_checkpoint:
         start_ckpt_args = ["--start_checkpoint", os.path.abspath(args.start_checkpoint)]
 
-    parameter_modes = (
-        ["shared_mlp", "all"]
-        if args.compare_parameter_modes
-        else [args.parameter_mode]
-    )
+    if args.weak_prior_exploratory:
+        experiments = [
+            {
+                "name": "real_only_shared_mlp",
+                "parameter_mode": "shared_mlp",
+                "lambda_teacher": 0.0,
+                "lambda_teacher_l1": 0.0,
+                "lambda_lpips": 0.0,
+                "lambda_trajectory": 0.0,
+                "lambda_anchor_reg": 0.0,
+            },
+            {
+                "name": "weak_prior_shared_mlp",
+                "parameter_mode": "shared_mlp",
+                "lambda_teacher": 0.05,
+                "lambda_teacher_l1": 0.1,
+                "lambda_lpips": 1.0,
+                "lambda_trajectory": 0.01,
+                "lambda_anchor_reg": 0.0,
+            },
+        ]
+    else:
+        parameter_modes = (
+            ["shared_mlp", "all"]
+            if args.compare_parameter_modes
+            else [args.parameter_mode]
+        )
+        experiments = [
+            {
+                "name": parameter_mode,
+                "parameter_mode": parameter_mode,
+                "lambda_teacher": args.lambda_teacher,
+                "lambda_teacher_l1": args.lambda_teacher_l1,
+                "lambda_lpips": args.lambda_lpips,
+                "lambda_trajectory": args.lambda_trajectory,
+                "lambda_anchor_reg": args.lambda_anchor_reg,
+            }
+            for parameter_mode in parameter_modes
+        ]
     distill_outputs = {}
-    for parameter_mode in parameter_modes:
+    for experiment in experiments:
+        experiment_name = experiment["name"]
+        parameter_mode = experiment["parameter_mode"]
         mode_output = (
             os.path.join(
                 args.output_dir,
                 f"distill_{args.viewcrafter_profile}_round"
-                f"{args.round}_{parameter_mode}",
+                f"{args.round}_{experiment_name}",
             )
-            if args.compare_parameter_modes
+            if args.compare_parameter_modes or args.weak_prior_exploratory
             else distill_output
         )
-        distill_outputs[parameter_mode] = mode_output
+        distill_outputs[experiment_name] = mode_output
         distill_cmd = [
             sys.executable, distill_script,
             "--source_path", args.source_path,
@@ -360,10 +421,11 @@ def main():
             "--distill_output", mode_output,
             "--teacher_cache_dir", teacher_cache,
             "--distill_iterations", str(args.distill_iterations),
-            "--lambda_teacher", str(args.lambda_teacher),
-            "--lambda_lpips", str(args.lambda_lpips),
-            "--lambda_trajectory", str(args.lambda_trajectory),
-            "--lambda_anchor_reg", str(args.lambda_anchor_reg),
+            "--lambda_teacher", str(experiment["lambda_teacher"]),
+            "--lambda_teacher_l1", str(experiment["lambda_teacher_l1"]),
+            "--lambda_lpips", str(experiment["lambda_lpips"]),
+            "--lambda_trajectory", str(experiment["lambda_trajectory"]),
+            "--lambda_anchor_reg", str(experiment["lambda_anchor_reg"]),
             "--parameter_mode", parameter_mode,
             "--position_lr_init", str(args.position_lr_init),
             "--position_lr_final", str(args.position_lr_final),

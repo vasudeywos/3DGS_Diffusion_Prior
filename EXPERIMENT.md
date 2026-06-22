@@ -92,6 +92,34 @@ The contribution is a study of neural parameter sharing under noisy pseudo-view
 supervision, with trajectory-level ViewCrafter consistency rather than
 independent image inpainting.
 
+## Weakly aligned exploratory branch
+
+When DUSt3R and COLMAP endpoint cameras do not align reliably, use
+`--weak_prior_exploratory`. This branch treats ViewCrafter as perceptual
+guidance rather than pixel-accurate geometric truth. It:
+
+- keeps at most 12 high-quality frames selected as adjacent pairs;
+- runs a matched real-only `shared_mlp` continuation;
+- runs a weak-prior `shared_mlp` continuation from the same Stage-1 state;
+- uses `lambda_teacher=0.05`, teacher L1 weight `0.1`, LPIPS weight `1.0`,
+  and trajectory weight `0.01`;
+- leaves anchor regularisation at zero because anchors are frozen in
+  `shared_mlp`.
+
+```bash
+python run_pipeline.py \
+  --source_path /path/to/bicycle \
+  --output_dir /path/to/output/bicycle_weak_prior \
+  --viewcrafter_root /path/to/ViewCrafter \
+  --viewcrafter_python /path/to/viewcrafter/bin/python \
+  --weak_prior_exploratory \
+  --gpu 0
+```
+
+The resulting comparison tests whether weak diffusion guidance helps beyond
+the same amount of real-only continued optimization. It must be described as
+weakly aligned diffusion-prior distillation, not exact novel-view supervision.
+
 ## ViewCrafter setup
 
 Clone the official repository and create its upstream-pinned environment:

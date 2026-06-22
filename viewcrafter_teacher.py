@@ -219,11 +219,17 @@ def cache_is_complete(cache_dir):
         ):
             calibrated = False
             break
+    configured_cap = int(complete.get("max_total_teachers", 0))
+    minimum_required = (
+        min(2, configured_cap)
+        if configured_cap > 0
+        else int(job["frame_filter"]["minimum_total_teachers"])
+    )
     return (
         job.get("schema_version") == SCHEMA_VERSION
         and job.get("signature") == signature
         and complete.get("signature") == signature
-        and expected >= int(job["frame_filter"]["minimum_total_teachers"])
+        and expected >= minimum_required
         and len(list((cache_dir / "teacher_images").glob("*.png"))) == expected
         and len(metadata_paths) == expected
         and calibrated

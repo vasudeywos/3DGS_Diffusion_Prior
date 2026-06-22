@@ -118,6 +118,7 @@ def anchor_regularisation_loss(
 def teacher_distillation_loss(
     rendered: torch.Tensor,
     teacher: torch.Tensor,
+    lambda_l1: float = 1.0,
     lambda_lpips: float = 0.1,
 ) -> torch.Tensor:
     """
@@ -138,7 +139,7 @@ def teacher_distillation_loss(
     teacher_lpips = teacher.unsqueeze(0) * 2.0 - 1.0
     perceptual = get_lpips_fn()(rendered_lpips, teacher_lpips).mean()
 
-    return l1 + lambda_lpips * perceptual
+    return lambda_l1 * l1 + lambda_lpips * perceptual
 
 
 def trajectory_delta_loss(render_a, render_b, teacher_a, teacher_b):
@@ -376,26 +377,32 @@ def train_distill(
     # -----------------------------------------------------------------------
     # 3. Load pre-generated ViewCrafter trajectory teachers
     # -----------------------------------------------------------------------
-    teacher_cache = os.path.join(distill_args.teacher_cache_dir, f"round{distill_args.round}")
-    if not cache_is_complete(teacher_cache):
+    uses_teacher_prior = (
+        distill_args.lambda_teacher > 0
+        or distill_args.lambda_trajectory > 0
+    )
+    teacher_cache = os.path.join(
+        distill_args.teacher_cache_dir, f"round{distill_args.round}"
+    )
+    if uses_teacher_prior and not cache_is_complete(teacher_cache):
         raise RuntimeError(
             f"ViewCrafter cache is missing or incomplete at {teacher_cache}. "
-            "Run prepare_viewcrafter_job.py and viewcrafter_bridge.py first, "
-            "or use run_pipeline.py to execute all stages."
+            "Run prepare_viewcrafter_job.py and viewcrafter_bridge.py first."
         )
-    teacher_dataset = ViewCrafterTeacherDataset(
-        teacher_cache, device="cuda"
-    )
-    minimum_teachers = distill_args.min_teacher_views
-    if len(teacher_dataset) < minimum_teachers:
-        raise RuntimeError(
-            f"Only {len(teacher_dataset)} teacher views passed filtering; "
-            f"at least {minimum_teachers} are required. Inspect rendered_rgb, "
-            "rendered_depth, and teacher_images, then adjust the pose path or "
-            "the ViewCrafter job and exported metadata."
+    teacher_dataset = None
+    if uses_teacher_prior:
+        teacher_dataset = ViewCrafterTeacherDataset(
+            teacher_cache, device="cuda"
         )
-
-    logger.info(f"Teacher dataset: {len(teacher_dataset)} pairs.")
+        minimum_teachers = distill_args.min_teacher_views
+        if len(teacher_dataset) < minimum_teachers:
+            raise RuntimeError(
+                f"Only {len(teacher_dataset)} teacher views passed filtering; "
+                f"at least {minimum_teachers} are required."
+            )
+        logger.info(f"Teacher dataset: {len(teacher_dataset)} pairs.")
+    else:
+        logger.info("Real-only control: teacher rendering/losses disabled.")
 
     # -----------------------------------------------------------------------
     # 4. Distillation training loop
@@ -457,43 +464,49 @@ def train_distill(
         # ------------------------------------------------------------------
         # 4b. Teacher distillation loss (novel views)
         # ------------------------------------------------------------------
-        (teacher_cam_a, teacher_img_a), (teacher_cam_b, teacher_img_b) = (
-            teacher_dataset.sample_adjacent()
-        )
-        rendered_teachers = []
-        for teacher_cam in (teacher_cam_a, teacher_cam_b):
-            visible_mask = prefilter_voxel(
-                teacher_cam, gaussians, pipe_args, background
+        if uses_teacher_prior:
+            (teacher_cam_a, teacher_img_a), (teacher_cam_b, teacher_img_b) = (
+                teacher_dataset.sample_adjacent()
             )
-            render_pkg = render(
-                teacher_cam,
-                gaussians,
-                pipe_args,
-                background,
-                visible_mask=visible_mask,
-                retain_grad=False,
-            )
-            rendered_teachers.append(render_pkg["render"])
-        rendered_teacher_a, rendered_teacher_b = rendered_teachers
+            rendered_teachers = []
+            for teacher_cam in (teacher_cam_a, teacher_cam_b):
+                visible_mask = prefilter_voxel(
+                    teacher_cam, gaussians, pipe_args, background
+                )
+                render_pkg = render(
+                    teacher_cam,
+                    gaussians,
+                    pipe_args,
+                    background,
+                    visible_mask=visible_mask,
+                    retain_grad=False,
+                )
+                rendered_teachers.append(render_pkg["render"])
+            rendered_teacher_a, rendered_teacher_b = rendered_teachers
 
-        L_teacher = 0.5 * (
-            teacher_distillation_loss(
+            L_teacher = 0.5 * (
+                teacher_distillation_loss(
+                    rendered_teacher_a,
+                    teacher_img_a,
+                    lambda_l1=distill_args.lambda_teacher_l1,
+                    lambda_lpips=distill_args.lambda_lpips,
+                )
+                + teacher_distillation_loss(
+                    rendered_teacher_b,
+                    teacher_img_b,
+                    lambda_l1=distill_args.lambda_teacher_l1,
+                    lambda_lpips=distill_args.lambda_lpips,
+                )
+            )
+            L_trajectory = trajectory_delta_loss(
                 rendered_teacher_a,
-                teacher_img_a,
-                lambda_lpips=distill_args.lambda_lpips,
-            )
-            + teacher_distillation_loss(
                 rendered_teacher_b,
+                teacher_img_a,
                 teacher_img_b,
-                lambda_lpips=distill_args.lambda_lpips,
             )
-        )
-        L_trajectory = trajectory_delta_loss(
-            rendered_teacher_a,
-            rendered_teacher_b,
-            teacher_img_a,
-            teacher_img_b,
-        )
+        else:
+            L_teacher = rendered_real.new_zeros(())
+            L_trajectory = rendered_real.new_zeros(())
 
         # ------------------------------------------------------------------
         # 4c. Anchor regularisation loss (soft geometry stiffness)
@@ -690,6 +703,7 @@ class DistillationParams:
 
         # Loss weights
         self.lambda_teacher = 0.2
+        self.lambda_teacher_l1 = 1.0
         self.lambda_lpips = 0.1
         self.lambda_trajectory = 0.03
         self.lambda_anchor_reg = 0.01
@@ -717,6 +731,7 @@ def add_distillation_args(parser: ArgumentParser):
     g.add_argument("--offset_lr_final", type=float, default=5e-5)
     g.add_argument("--min_teacher_views", type=int, default=8)
     g.add_argument("--lambda_teacher", type=float, default=0.2)
+    g.add_argument("--lambda_teacher_l1", type=float, default=1.0)
     g.add_argument("--lambda_lpips", type=float, default=0.1)
     g.add_argument(
         "--lambda_trajectory",

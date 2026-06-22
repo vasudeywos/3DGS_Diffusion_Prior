@@ -38,7 +38,26 @@ def parse_args():
         default=45.0,
         help="Maximum mean endpoint camera-axis error in degrees.",
     )
+    parser.add_argument(
+        "--teacher_pose_source",
+        choices=["scaffold", "dust3r"],
+        default="scaffold",
+        help=(
+            "Camera poses attached to generated teachers. 'scaffold' uses "
+            "the predefined interpolation between COLMAP endpoints; 'dust3r' "
+            "requires DUSt3R alignment to pass both validation thresholds."
+        ),
+    )
     parser.add_argument("--prompt", default="Rotating view of a scene")
+    parser.add_argument(
+        "--max_total_teachers",
+        type=int,
+        default=0,
+        help=(
+            "Optional global teacher cap. Selects the strongest adjacent "
+            "frame pairs by quality; 0 keeps the per-clip selection."
+        ),
+    )
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args()
 
@@ -101,7 +120,11 @@ def main():
             f"got {[height, width]}."
         )
 
-    minimum_teachers = int(job["frame_filter"]["minimum_total_teachers"])
+    minimum_teachers = (
+        min(2, args.max_total_teachers)
+        if args.max_total_teachers > 0
+        else int(job["frame_filter"]["minimum_total_teachers"])
+    )
     checkpoint_stat = checkpoint.stat()
     checkpoint_fingerprint = (
         f"{checkpoint_stat.st_size}:{checkpoint_stat.st_mtime_ns}"
@@ -126,6 +149,10 @@ def main():
             and complete.get("ddim_steps") == args.ddim_steps
             and complete.get("bg_trd") == args.bg_trd
             and complete.get("prompt") == args.prompt
+            and complete.get("max_total_teachers")
+            == args.max_total_teachers
+            and complete.get("teacher_pose_source")
+            == args.teacher_pose_source
             and teacher_count == complete.get("teacher_count")
             and metadata_count == complete.get("teacher_count")
         ):
@@ -557,18 +584,25 @@ def main():
         f"{np.linalg.det(align_rotation):.0f}, camera basis="
         f"{np.diag(camera_basis).astype(int).tolist()}."
     )
-    if normalized_alignment_error > args.max_alignment_error:
+    dust3r_alignment_valid = (
+        normalized_alignment_error <= args.max_alignment_error
+        and rotation_alignment_error <= args.max_rotation_alignment_error
+    )
+    if args.teacher_pose_source == "dust3r" and not dust3r_alignment_valid:
         raise RuntimeError(
-            "DUSt3R camera alignment is unreliable: normalized RMSE "
-            f"{normalized_alignment_error:.4f} exceeds "
-            f"{args.max_alignment_error:.4f}. Inspect the five ordered inputs "
-            "or adjust DUSt3R confidence/background thresholds."
+            "DUSt3R teacher poses were requested, but alignment is "
+            "unreliable: normalized center RMSE "
+            f"{normalized_alignment_error:.4f} (limit "
+            f"{args.max_alignment_error:.4f}), mean rotation error "
+            f"{rotation_alignment_error:.2f} degrees (limit "
+            f"{args.max_rotation_alignment_error:.2f})."
         )
-    if rotation_alignment_error > args.max_rotation_alignment_error:
-        raise RuntimeError(
-            "DUSt3R camera-axis alignment is unreliable: mean rotation "
-            f"error {rotation_alignment_error:.2f} degrees exceeds "
-            f"{args.max_rotation_alignment_error:.2f} degrees."
+    if args.teacher_pose_source == "scaffold" and not dust3r_alignment_valid:
+        print(
+            "WARNING: DUSt3R endpoint cameras disagree with COLMAP. "
+            "Generated pixels will use their matched interpolation index, "
+            "but teacher metadata will retain the predefined Scaffold/COLMAP "
+            "interpolation poses. DUSt3R-aligned poses will not be exported."
         )
 
     quality_report = []
@@ -651,6 +685,9 @@ def main():
             accepted = [accepted[round(position)] for position in positions]
         return {record["frame_index"] for record in accepted}
 
+    selected_by_clip = {}
+    records_by_clip = {}
+    clip_tensors = {}
     for clip_record in job["clips"]:
         clip_index = clip_record["clip_index"]
         source_segment_index = clip_record["source_segment_index"]
@@ -676,6 +713,68 @@ def main():
             "selected_frames": sorted(selected),
             "frames": records,
         })
+        selected_by_clip[clip_index] = selected
+        records_by_clip[clip_index] = {
+            record["frame_index"]: record for record in records
+        }
+        clip_tensors[clip_index] = clip_tensor
+
+    if args.max_total_teachers > 0:
+        if args.max_total_teachers < 2:
+            raise ValueError("--max_total_teachers must be 0 or at least 2.")
+        pair_candidates = []
+        for clip_record in job["clips"]:
+            clip_index = clip_record["clip_index"]
+            selected = sorted(selected_by_clip[clip_index])
+            records = records_by_clip[clip_index]
+            for first, second in zip(selected[:-1], selected[1:]):
+                # Only consecutive generated frames are true local temporal
+                # neighbors; avoid constructing a misleading delta otherwise.
+                if second != first + 1:
+                    continue
+                score = (
+                    records[first]["quality_score"]
+                    + records[second]["quality_score"]
+                ) / 2.0
+                pair_candidates.append(
+                    (score, clip_index, first, second)
+                )
+        pair_candidates.sort(reverse=True)
+        globally_selected = {}
+        for _, clip_index, first, second in pair_candidates:
+            current_total = sum(
+                len(indices) for indices in globally_selected.values()
+            )
+            additions = {
+                first, second
+            } - globally_selected.setdefault(clip_index, set())
+            if current_total + len(additions) > args.max_total_teachers:
+                continue
+            globally_selected[clip_index].update((first, second))
+            if sum(
+                len(indices) for indices in globally_selected.values()
+            ) >= args.max_total_teachers:
+                break
+        selected_count = sum(
+            len(indices) for indices in globally_selected.values()
+        )
+        if selected_count < 2:
+            raise RuntimeError(
+                "No high-quality adjacent frame pair survived the global "
+                "teacher cap."
+            )
+        selected_by_clip = globally_selected
+        print(
+            f"Global weak-prior selection retained {selected_count} teacher "
+            f"frames (cap={args.max_total_teachers})."
+        )
+
+    for clip_record in job["clips"]:
+        clip_index = clip_record["clip_index"]
+        source_segment_index = clip_record["source_segment_index"]
+        clip_tensor = clip_tensors[clip_index]
+        records = list(records_by_clip[clip_index].values())
+        selected = selected_by_clip.get(clip_index, set())
         for teacher in clip_record["teachers"]:
             frame_index = teacher["frame_index"]
             if frame_index not in selected:
@@ -688,16 +787,24 @@ def main():
                 dust_trajectory_c2ws[trajectory_index]
                 .detach().cpu().numpy()
             )
-            aligned_rotation = (
-                align_rotation @ dust_pose[:3, :3] @ camera_basis
-            ).astype(np.float32)
-            aligned_position = (
-                align_scale * align_rotation @ dust_pose[:3, 3]
-                + align_translation
-            ).astype(np.float32)
-            aligned_translation = (
-                -aligned_rotation.T @ aligned_position
-            ).astype(np.float32)
+            if args.teacher_pose_source == "dust3r":
+                teacher_rotation = (
+                    align_rotation @ dust_pose[:3, :3] @ camera_basis
+                ).astype(np.float32)
+                teacher_position = (
+                    align_scale * align_rotation @ dust_pose[:3, 3]
+                    + align_translation
+                ).astype(np.float32)
+                teacher_translation = (
+                    -teacher_rotation.T @ teacher_position
+                ).astype(np.float32)
+            else:
+                teacher_rotation = np.asarray(
+                    teacher["R"], dtype=np.float32
+                )
+                teacher_translation = np.asarray(
+                    teacher["T"], dtype=np.float32
+                )
             fx, fy, cx, cy = frame_intrinsics(trajectory_index)
             filename = (
                 f"clip_{clip_index:02d}_frame_{frame_index:02d}.png"
@@ -708,8 +815,9 @@ def main():
             Image.fromarray(array).save(teacher_dir / filename)
 
             record = dict(teacher)
-            record["R"] = aligned_rotation.tolist()
-            record["T"] = aligned_translation.tolist()
+            record["R"] = teacher_rotation.tolist()
+            record["T"] = teacher_translation.tolist()
+            record["pose_source"] = args.teacher_pose_source
             record["height"] = int(height)
             record["width"] = int(width)
             record["fx"] = fx
@@ -755,11 +863,14 @@ def main():
         "ddim_steps": args.ddim_steps,
         "bg_trd": args.bg_trd,
         "prompt": args.prompt,
+        "max_total_teachers": args.max_total_teachers,
         "camera_alignment_rmse": alignment_rmse,
         "normalized_camera_alignment_error": normalized_alignment_error,
         "mean_rotation_alignment_error_degrees": rotation_alignment_error,
         "alignment_world_determinant": float(np.linalg.det(align_rotation)),
         "alignment_camera_basis": camera_basis.tolist(),
+        "dust3r_alignment_valid": dust3r_alignment_valid,
+        "teacher_pose_source": args.teacher_pose_source,
         "intrinsics_source": "viewcrafter_pytorch3d_trajectory",
         "intrinsics_summary": intrinsics_summary,
         "quality_report": quality_report,
