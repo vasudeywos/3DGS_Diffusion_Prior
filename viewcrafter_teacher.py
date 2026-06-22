@@ -1,9 +1,3 @@
-"""Shared ViewCrafter job and teacher-cache utilities.
-
-The ViewCrafter process runs in its own environment.  This module defines the
-disk contract used by both that process and Scaffold-GS training.
-"""
-
 import hashlib
 import json
 from pathlib import Path

@@ -20,7 +20,13 @@ if "--gpu" in sys.argv:
     if gpu_index + 1 < len(sys.argv):
         requested_gpu = sys.argv[gpu_index + 1]
 
-if requested_gpu is not None and requested_gpu != "-1":
+# Respect a scheduler/user-provided visibility mask. Within that mask, CUDA
+# devices are renumbered from zero, so `CUDA_VISIBLE_DEVICES=6 --gpu 0`
+# correctly means physical GPU 6 / logical GPU 0.
+inherited_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
+if inherited_visible_devices:
+    pass
+elif requested_gpu is not None and requested_gpu != "-1":
     os.environ["CUDA_VISIBLE_DEVICES"] = requested_gpu
 else:
     cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
@@ -319,7 +325,9 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
         # gts
-        gt = view.original_image[0:3, :, :]
+        gt = view.original_image[0:3, :, :].to(
+            rendering.device, non_blocking=True
+        )
         
         # error maps
         errormap = (rendering - gt).abs()
@@ -501,10 +509,13 @@ if __name__ == "__main__":
 
     logger.info(f'args: {args}')
 
-    if args.gpu != '-1':
+    if args.gpu != '-1' and not inherited_visible_devices:
         os.environ['CUDA_VISIBLE_DEVICES'] = str(args.gpu)
         os.system("echo $CUDA_VISIBLE_DEVICES")
-        logger.info(f'using GPU {args.gpu}')
+    logger.info(
+        f"using logical GPU {args.gpu}; "
+        f"CUDA_VISIBLE_DEVICES={os.environ.get('CUDA_VISIBLE_DEVICES', '')}"
+    )
 
     
 

@@ -1,9 +1,3 @@
-"""Run ViewCrafter_25_512 in its isolated environment and export PNG teachers.
-
-This file must be executed with the ViewCrafter conda environment, not the
-Scaffold-GS environment.
-"""
-
 import argparse
 import json
 import os

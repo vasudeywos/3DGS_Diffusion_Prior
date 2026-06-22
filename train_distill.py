@@ -34,7 +34,7 @@ import os
 import sys
 
 # CUDA must be selected before importing torch or modules that may initialise it.
-if "--gpu" in sys.argv:
+if "--gpu" in sys.argv and not os.environ.get("CUDA_VISIBLE_DEVICES"):
     _gpu_index = sys.argv.index("--gpu")
     if _gpu_index + 1 < len(sys.argv) and sys.argv[_gpu_index + 1] != "-1":
         os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[_gpu_index + 1]
@@ -740,7 +740,7 @@ if __name__ == "__main__":
     args = parser.parse_args(cli_argv)
 
     # GPU selection
-    if args.gpu != "-1":
+    if args.gpu != "-1" and not os.environ.get("CUDA_VISIBLE_DEVICES"):
         os.environ["CUDA_VISIBLE_DEVICES"] = str(args.gpu)
 
     args.model_path = os.path.abspath(args.model_path)
