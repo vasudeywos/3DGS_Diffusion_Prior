@@ -4,6 +4,8 @@ import os
 import sys
 from pathlib import Path
 
+import sys
+print("PYTHON =", sys.executable)
 
 def parse_args():
     parser = argparse.ArgumentParser(description=__doc__)
