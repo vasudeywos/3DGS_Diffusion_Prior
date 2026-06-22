@@ -20,9 +20,9 @@ if "--gpu" in sys.argv:
     if gpu_index + 1 < len(sys.argv):
         requested_gpu = sys.argv[gpu_index + 1]
 
-# Respect a scheduler/user-provided visibility mask. Within that mask, CUDA
-# devices are renumbered from zero, so `CUDA_VISIBLE_DEVICES=6 --gpu 0`
-# correctly means physical GPU 6 / logical GPU 0.
+# Respect a scheduler/user-provided visibility mask. CUDA devices inside an
+# existing mask are addressed by their logical indices and must not be
+# remapped here.
 inherited_visible_devices = os.environ.get("CUDA_VISIBLE_DEVICES")
 if inherited_visible_devices:
     pass
