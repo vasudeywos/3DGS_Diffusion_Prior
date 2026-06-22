@@ -178,3 +178,9 @@ are moved to CPU immediately so multiple clips do not accumulate in GPU
 memory, but this cannot reduce the peak memory of the model plus one active
 25-frame clip. Do not reduce `video_length` without first confirming that the
 chosen checkpoint and configuration support a different temporal length.
+
+PyTorch3D coarse rendering is chunked independently of diffusion using
+`--viewcrafter_render_chunk_size 4`. If a chunk still OOMs, the bridge retries
+with progressively smaller chunks down to fully sequential one-camera
+rendering. This preserves the complete 25-frame diffusion sequence and camera
+ordering.

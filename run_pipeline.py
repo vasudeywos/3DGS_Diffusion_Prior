@@ -97,6 +97,7 @@ def main():
     )
     parser.add_argument("--viewcrafter_ddim_steps", type=int, default=50)
     parser.add_argument("--viewcrafter_bg_trd", type=float, default=0.2)
+    parser.add_argument("--viewcrafter_render_chunk_size", type=int, default=4)
     parser.add_argument(
         "--viewcrafter_max_alignment_error", type=float, default=0.15
     )
@@ -303,6 +304,8 @@ def main():
             "--device", "cuda:0",
             "--ddim_steps", str(args.viewcrafter_ddim_steps),
             "--bg_trd", str(args.viewcrafter_bg_trd),
+            "--render_chunk_size",
+            str(args.viewcrafter_render_chunk_size),
             "--max_alignment_error",
             str(args.viewcrafter_max_alignment_error),
         ]

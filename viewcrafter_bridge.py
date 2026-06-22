@@ -18,6 +18,15 @@ def parse_args():
     parser.add_argument("--ddim_steps", type=int, default=50)
     parser.add_argument("--bg_trd", type=float, default=0.2)
     parser.add_argument(
+        "--render_chunk_size",
+        type=int,
+        default=4,
+        help=(
+            "Number of PyTorch3D trajectory views rendered together. "
+            "Automatically halves on CUDA OOM down to one view."
+        ),
+    )
+    parser.add_argument(
         "--max_alignment_error",
         type=float,
         default=0.15,
@@ -136,7 +145,11 @@ def main():
     from configs.infer_config import get_parser
     from dust3r.utils.device import to_numpy
     from dust3r.utils.image import load_images
-    from utils.pvd_utils import generate_traj_interp, interp_traj
+    from utils.pvd_utils import (
+        generate_traj_interp,
+        interp_traj,
+        setup_renderer,
+    )
     from viewcrafter import ViewCrafter
 
     class ScaffoldViewCrafter(ViewCrafter):
@@ -165,6 +178,84 @@ def main():
                 )
                 originals.append(tensor.squeeze(0).permute(1, 2, 0))
             return images, originals
+
+        def run_render(
+            self,
+            pcd,
+            imgs,
+            masks,
+            render_h,
+            render_w,
+            camera_traj,
+            num_views,
+            nbv=False,
+        ):
+            """Render the trajectory in bounded view batches.
+
+            Upstream extends the complete point cloud to every trajectory
+            camera at once. With five inputs and 97 interpolated poses this can
+            exceed 20 GiB before diffusion starts.
+            """
+            total_views = int(num_views)
+            chunk_size = min(max(1, args.render_chunk_size), total_views)
+
+            while True:
+                rendered_chunks = []
+                mask_chunks = []
+                try:
+                    for start in range(0, total_views, chunk_size):
+                        end = min(start + chunk_size, total_views)
+                        chunk_cameras = camera_traj[start:end]
+                        renderer = setup_renderer(
+                            chunk_cameras,
+                            image_size=(render_h, render_w),
+                        )["renderer"]
+                        rendered, viewmask = self.render_pcd(
+                            pcd,
+                            imgs,
+                            masks,
+                            end - start,
+                            renderer,
+                            self.device,
+                            nbv=nbv,
+                        )
+                        rendered_chunks.append(rendered.detach().cpu())
+                        if viewmask is not None:
+                            mask_chunks.append(viewmask.detach().cpu())
+                        del renderer, rendered, viewmask
+                        if torch.cuda.is_available():
+                            torch.cuda.empty_cache()
+
+                    render_results = torch.cat(rendered_chunks, dim=0)
+                    view_masks = (
+                        torch.cat(mask_chunks, dim=0)
+                        if mask_chunks
+                        else None
+                    )
+                    print(
+                        f"Rendered {total_views} trajectory views in chunks "
+                        f"of {chunk_size}."
+                    )
+                    return render_results, view_masks
+                except RuntimeError as error:
+                    if "out of memory" not in str(error).lower():
+                        raise
+                    rendered_chunks.clear()
+                    mask_chunks.clear()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
+                    if chunk_size == 1:
+                        raise RuntimeError(
+                            "ViewCrafter point-cloud rendering still OOMs with "
+                            "one camera at a time. Reduce point-cloud density "
+                            "or use a larger-memory GPU."
+                        )
+                    new_chunk_size = max(1, chunk_size // 2)
+                    print(
+                        f"CUDA OOM with render_chunk_size={chunk_size}; "
+                        f"retrying from the beginning with {new_chunk_size}."
+                    )
+                    chunk_size = new_chunk_size
 
         def generate_sparse_clips(self):
             c2ws = self.scene.get_im_poses().detach()
@@ -269,6 +360,8 @@ def main():
     opts.model_path = str(dust3r_checkpoint)
     opts.prompt = args.prompt
     opts.perframe_ae = True
+    if args.render_chunk_size < 1:
+        raise ValueError("--render_chunk_size must be at least 1.")
     Path(opts.save_dir).mkdir(parents=True, exist_ok=True)
 
     if torch.cuda.is_available():
