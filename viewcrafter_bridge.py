@@ -697,7 +697,13 @@ def main():
                 f"Clip {clip_index} has {clip_tensor.shape[0]} frames; "
                 f"expected {job['video_length']}."
             )
-        clip_tensor = ((clip_tensor + 1.0) / 2.0).clamp(0, 1)
+        # Completed diffusion clips are retained on CPU to save VRAM.
+        # PyTorch 1.13 cannot clamp CPU float16 tensors, so normalize in
+        # float32. Teacher PNG export is 8-bit, making this conversion lossless
+        # for the persisted supervision.
+        clip_tensor = (
+            (clip_tensor.float() + 1.0) / 2.0
+        ).clamp(0, 1)
         candidates = [
             teacher["frame_index"] for teacher in clip_record["teachers"]
         ]
