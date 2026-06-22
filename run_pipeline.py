@@ -29,6 +29,7 @@ Usage:
 import os
 import sys
 import subprocess
+import json
 from pathlib import Path
 from argparse import ArgumentParser
 
@@ -43,6 +44,20 @@ def run_cmd(cmd: list, dry_run: bool = False, cwd: Path = SCAFFOLD_ROOT):
         subprocess.run(cmd, cwd=str(cwd), check=True)
 
 
+def find_metrics(payload):
+    if isinstance(payload, dict):
+        if all(key in payload for key in ("PSNR", "SSIM", "LPIPS")):
+            return {
+                key: payload[key]
+                for key in ("PSNR", "SSIM", "LPIPS")
+            }
+        for value in payload.values():
+            metrics = find_metrics(value)
+            if metrics is not None:
+                return metrics
+    return None
+
+
 def main():
     parser = ArgumentParser()
     parser.add_argument("--source_path", type=str, required=True)
@@ -52,6 +67,8 @@ def main():
     parser.add_argument("--train_views_file", type=str, default=None)
     parser.add_argument("--test_views_file", type=str, default=None)
     parser.add_argument("--gpu", type=str, default="0")
+    parser.add_argument("--resolution", type=int, default=4)
+    parser.add_argument("--stage1_iterations", type=int, default=30000)
     parser.add_argument("--skip_stage1", action="store_true")
     parser.add_argument("--round", type=int, default=1)
     parser.add_argument("--start_checkpoint", type=str, default=None)
@@ -61,6 +78,12 @@ def main():
     parser.add_argument("--viewcrafter_checkpoint", type=str, default=None)
     parser.add_argument("--dust3r_checkpoint", type=str, default=None)
     parser.add_argument("--viewcrafter_config", type=str, default=None)
+    parser.add_argument(
+        "--viewcrafter_profile",
+        choices=["512", "sparse"],
+        default="512",
+        help="Use the 320x512 ablation checkpoint or sparse-view 576x1024 checkpoint.",
+    )
     parser.add_argument("--viewcrafter_min_frames_per_clip", type=int, default=8)
     parser.add_argument("--viewcrafter_max_frames_per_clip", type=int, default=12)
     parser.add_argument("--viewcrafter_max_pair_angle", type=float, default=110.0)
@@ -79,12 +102,18 @@ def main():
     parser.add_argument("--viewcrafter_seed", type=int, default=123)
     parser.add_argument("--skip_viewcrafter", action="store_true")
     parser.add_argument("--lambda_teacher", type=float, default=0.2)
+    parser.add_argument("--lambda_lpips", type=float, default=0.1)
     parser.add_argument("--lambda_trajectory", type=float, default=0.03)
     parser.add_argument("--lambda_anchor_reg", type=float, default=0.01)
     parser.add_argument(
         "--parameter_mode",
         choices=["all", "shared_mlp", "shared_mlp_features", "shared_mlp_geometry"],
         default="all",
+    )
+    parser.add_argument(
+        "--compare_parameter_modes",
+        action="store_true",
+        help="Run shared_mlp and all from the same Stage-1 checkpoint/cache.",
     )
     parser.add_argument("--position_lr_init", type=float, default=1e-4)
     parser.add_argument("--position_lr_final", type=float, default=1e-6)
@@ -97,21 +126,25 @@ def main():
         "--densification_trajectory_weight", type=float, default=0.01
     )
     parser.add_argument("--dry_run", action="store_true")
+    parser.add_argument(
+        "--sanity_200",
+        action="store_true",
+        help="Run a 200-iteration Stage-1 + shared_mlp/all sanity comparison.",
+    )
     args = parser.parse_args()
+    if args.sanity_200:
+        args.stage1_iterations = 200
+        args.distill_iterations = 200
+        args.compare_parameter_modes = True
+    if args.compare_parameter_modes and args.enable_densification_phase:
+        raise ValueError(
+            "--compare_parameter_modes cannot be combined with the optional "
+            "densification phase."
+        )
 
     args.source_path = os.path.abspath(args.source_path)
     args.output_dir = os.path.abspath(args.output_dir)
     stage1_output = os.path.join(args.output_dir, "stage1")
-    distill_output = os.path.join(
-        args.output_dir, f"distill_round{args.round}_stable"
-    )
-    densified_output = os.path.join(
-        args.output_dir, f"distill_round{args.round}_densified"
-    )
-    teacher_cache = os.path.join(args.output_dir, "teacher_cache")
-    round_teacher_cache = os.path.join(
-        teacher_cache, f"round{args.round}"
-    )
     distill_script = str(SCRIPT_DIR / "train_distill.py")
     viewcrafter_root = Path(
         args.viewcrafter_root or SCRIPT_DIR / "ViewCrafter"
@@ -120,9 +153,39 @@ def main():
         args.viewcrafter_python
         or Path.home() / "miniconda3/envs/viewcrafter/bin/python"
     ).expanduser().resolve())
+    profile = {
+        "512": {
+            "checkpoint_name": "ViewCrafter_25_512",
+            "height": 320,
+            "width": 512,
+            "checkpoint": "model.ckpt",
+            "config": "inference_pvd_512.yaml",
+        },
+        "sparse": {
+            "checkpoint_name": "ViewCrafter_25_sparse",
+            "height": 576,
+            "width": 1024,
+            "checkpoint": "model_sparse.ckpt",
+            "config": "inference_pvd_1024.yaml",
+        },
+    }[args.viewcrafter_profile]
+    distill_output = os.path.join(
+        args.output_dir,
+        f"distill_{args.viewcrafter_profile}_round{args.round}_stable",
+    )
+    densified_output = os.path.join(
+        args.output_dir,
+        f"distill_{args.viewcrafter_profile}_round{args.round}_densified",
+    )
+    teacher_cache = os.path.join(
+        args.output_dir, "teacher_cache", args.viewcrafter_profile
+    )
+    round_teacher_cache = os.path.join(
+        teacher_cache, f"round{args.round}"
+    )
     viewcrafter_checkpoint = Path(
         args.viewcrafter_checkpoint
-        or viewcrafter_root / "checkpoints/model.ckpt"
+        or viewcrafter_root / "checkpoints" / profile["checkpoint"]
     ).expanduser().resolve()
     dust3r_checkpoint = Path(
         args.dust3r_checkpoint
@@ -131,7 +194,7 @@ def main():
     ).expanduser().resolve()
     viewcrafter_config = Path(
         args.viewcrafter_config
-        or viewcrafter_root / "configs/inference_pvd_512.yaml"
+        or viewcrafter_root / "configs" / profile["config"]
     ).expanduser().resolve()
 
     os.makedirs(args.output_dir, exist_ok=True)
@@ -174,15 +237,16 @@ def main():
             "--train_views_file", train_views_file,
             "--test_views_file", test_views_file,
             "--model_path", stage1_output,
-            "--iterations", "30000",
+            "--iterations", str(args.stage1_iterations),
+            "--resolution", str(args.resolution),
             "--voxel_size", "0.001",
             "--update_init_factor", "16",
             "--appearance_dim", "0",
             "--data_device", "cpu",
             "--ratio", "1",
             "--gpu", args.gpu,
-            "--save_iterations", "30000",
-            "--test_iterations", "30000",
+            "--save_iterations", str(args.stage1_iterations),
+            "--test_iterations", str(args.stage1_iterations),
             "--eval",
         ]
         run_cmd(stage1_cmd, dry_run=args.dry_run)
@@ -201,7 +265,7 @@ def main():
         "--test_views_file", test_views_file,
         "--model_path", stage1_output,
         "--data_device", "cpu",
-        "--stage1_iteration", "30000",
+        "--stage1_iteration", str(args.stage1_iterations),
         "--output_dir", round_teacher_cache,
         "--video_length", "25",
         "--min_frames_per_clip", str(args.viewcrafter_min_frames_per_clip),
@@ -214,9 +278,9 @@ def main():
         str(args.viewcrafter_max_normalized_baseline),
         "--max_radial_difference",
         str(args.viewcrafter_max_radial_difference),
-        "--viewcrafter_height", "320",
-        "--viewcrafter_width", "512",
-        "--checkpoint_name", "ViewCrafter_25_512",
+        "--viewcrafter_height", str(profile["height"]),
+        "--viewcrafter_width", str(profile["width"]),
+        "--checkpoint_name", profile["checkpoint_name"],
         "--seed", str(args.viewcrafter_seed),
         "--eval",
     ]
@@ -244,6 +308,13 @@ def main():
     else:
         print("Skipping Stage 3 (--skip_viewcrafter set).")
 
+    validate_cache_cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / "validate_viewcrafter_cache.py"),
+        "--cache_dir", round_teacher_cache,
+    ]
+    run_cmd(validate_cache_cmd, dry_run=args.dry_run, cwd=SCRIPT_DIR)
+
     # ------------------------------------------------------------------
     # Stage 4: Distillation fine-tuning
     # ------------------------------------------------------------------
@@ -255,31 +326,50 @@ def main():
     if args.start_checkpoint:
         start_ckpt_args = ["--start_checkpoint", os.path.abspath(args.start_checkpoint)]
 
-    distill_cmd = [
-        sys.executable, distill_script,
-        "--source_path", args.source_path,
-        "--images", args.images,
-        "--train_views_file", train_views_file,
-        "--test_views_file", test_views_file,
-        "--model_path", stage1_output,
-        "--data_device", "cpu",
-        "--distill_output", distill_output,
-        "--teacher_cache_dir", teacher_cache,
-        "--distill_iterations", str(args.distill_iterations),
-        "--lambda_teacher", str(args.lambda_teacher),
-        "--lambda_trajectory", str(args.lambda_trajectory),
-        "--lambda_anchor_reg", str(args.lambda_anchor_reg),
-        "--parameter_mode", args.parameter_mode,
-        "--position_lr_init", str(args.position_lr_init),
-        "--position_lr_final", str(args.position_lr_final),
-        "--offset_lr_init", str(args.offset_lr_init),
-        "--offset_lr_final", str(args.offset_lr_final),
-        "--stage1_iteration", "30000",
-        "--round", str(args.round),
-        "--gpu", args.gpu,
-        "--eval",
-    ] + start_ckpt_args
-    run_cmd(distill_cmd, dry_run=args.dry_run)
+    parameter_modes = (
+        ["shared_mlp", "all"]
+        if args.compare_parameter_modes
+        else [args.parameter_mode]
+    )
+    distill_outputs = {}
+    for parameter_mode in parameter_modes:
+        mode_output = (
+            os.path.join(
+                args.output_dir,
+                f"distill_{args.viewcrafter_profile}_round"
+                f"{args.round}_{parameter_mode}",
+            )
+            if args.compare_parameter_modes
+            else distill_output
+        )
+        distill_outputs[parameter_mode] = mode_output
+        distill_cmd = [
+            sys.executable, distill_script,
+            "--source_path", args.source_path,
+            "--images", args.images,
+            "--train_views_file", train_views_file,
+            "--test_views_file", test_views_file,
+            "--model_path", stage1_output,
+            "--data_device", "cpu",
+            "--resolution", str(args.resolution),
+            "--distill_output", mode_output,
+            "--teacher_cache_dir", teacher_cache,
+            "--distill_iterations", str(args.distill_iterations),
+            "--lambda_teacher", str(args.lambda_teacher),
+            "--lambda_lpips", str(args.lambda_lpips),
+            "--lambda_trajectory", str(args.lambda_trajectory),
+            "--lambda_anchor_reg", str(args.lambda_anchor_reg),
+            "--parameter_mode", parameter_mode,
+            "--position_lr_init", str(args.position_lr_init),
+            "--position_lr_final", str(args.position_lr_final),
+            "--offset_lr_init", str(args.offset_lr_init),
+            "--offset_lr_final", str(args.offset_lr_final),
+            "--stage1_iteration", str(args.stage1_iterations),
+            "--round", str(args.round),
+            "--gpu", args.gpu,
+            "--eval",
+        ] + start_ckpt_args
+        run_cmd(distill_cmd, dry_run=args.dry_run)
 
     if args.enable_densification_phase:
         stable_checkpoint = os.path.join(
@@ -308,17 +398,55 @@ def main():
             "--offset_lr_init", str(args.offset_lr_final),
             "--offset_lr_final", str(args.offset_lr_final * 0.2),
             "--start_checkpoint", stable_checkpoint,
-            "--stage1_iteration", "30000",
+            "--stage1_iteration", str(args.stage1_iterations),
             "--round", str(args.round),
             "--gpu", args.gpu,
             "--eval",
         ]
         run_cmd(densify_cmd, dry_run=args.dry_run)
 
+    if not args.dry_run:
+        summary = {
+            "stage1_iterations": args.stage1_iterations,
+            "distill_iterations": args.distill_iterations,
+            "viewcrafter_profile": args.viewcrafter_profile,
+            "stage1": None,
+            "distillation": {},
+        }
+        stage1_results = Path(stage1_output) / "results.json"
+        if stage1_results.is_file():
+            summary["stage1"] = find_metrics(
+                json.loads(stage1_results.read_text())
+            )
+        for mode, output in distill_outputs.items():
+            result_path = Path(output) / f"results_round{args.round}.json"
+            if result_path.is_file():
+                result = json.loads(result_path.read_text())
+                metrics = find_metrics(result)
+                summary["distillation"][mode] = {
+                    "metrics": metrics,
+                    "delta_vs_stage1": (
+                        {
+                            key: metrics[key] - summary["stage1"][key]
+                            for key in ("PSNR", "SSIM", "LPIPS")
+                        }
+                        if metrics is not None and summary["stage1"] is not None
+                        else None
+                    ),
+                    "details": result,
+                }
+        summary_path = (
+            Path(args.output_dir)
+            / f"comparison_summary_{args.viewcrafter_profile}.json"
+        )
+        summary_path.write_text(json.dumps(summary, indent=2))
+        print(f"Comparison summary: {summary_path}")
+
     print("\n" + "=" * 60)
     print("Pipeline complete.")
     print(f"Stage 1 output:     {stage1_output}")
-    print(f"Distill output:     {distill_output}")
+    for mode, output in distill_outputs.items():
+        print(f"Distill ({mode}): {output}")
     if args.enable_densification_phase:
         print(f"Densified output:   {densified_output}")
     print(f"Teacher cache:      {teacher_cache}")

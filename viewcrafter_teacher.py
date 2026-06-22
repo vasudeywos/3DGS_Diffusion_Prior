@@ -8,10 +8,14 @@ from PIL import Image
 
 from novel_view_sampler import _fit_ellipse_to_cameras, _focus_point_fn
 from scene.cameras import Camera
-from utils.graphics_utils import getProjectionMatrix
+from utils.graphics_utils import (
+    focal2fov,
+    getProjectionMatrix,
+    getProjectionMatrixFromIntrinsics,
+)
 
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def _camera_c2w(camera):
@@ -201,27 +205,73 @@ def cache_is_complete(cache_dir):
         return False
     signature = compute_job_signature(job)
     expected = int(complete.get("teacher_count", 0))
+    metadata_paths = list((cache_dir / "metadata").glob("*.json"))
+    calibrated = True
+    for path in metadata_paths:
+        try:
+            record = json.loads(path.read_text())
+        except (OSError, json.JSONDecodeError):
+            calibrated = False
+            break
+        if not all(
+            key in record
+            for key in ("fx", "fy", "cx", "cy", "height", "width")
+        ):
+            calibrated = False
+            break
     return (
-        job.get("signature") == signature
+        job.get("schema_version") == SCHEMA_VERSION
+        and job.get("signature") == signature
         and complete.get("signature") == signature
         and expected >= int(job["frame_filter"]["minimum_total_teachers"])
         and len(list((cache_dir / "teacher_images").glob("*.png"))) == expected
-        and len(list((cache_dir / "metadata").glob("*.json"))) == expected
+        and len(metadata_paths) == expected
+        and calibrated
     )
 
 
 def record_to_camera(record, device="cuda"):
+    width = int(record["width"])
+    height = int(record["height"])
+    fx = float(record.get("fx", width / (2.0 * np.tan(float(record["FoVx"]) / 2.0))))
+    fy = float(record.get("fy", height / (2.0 * np.tan(float(record["FoVy"]) / 2.0))))
+    cx = float(record.get("cx", width / 2.0))
+    cy = float(record.get("cy", height / 2.0))
+    if not (0.0 <= cx <= width and 0.0 <= cy <= height):
+        raise ValueError(
+            f"Invalid principal point ({cx}, {cy}) for {width}x{height} "
+            f"teacher camera {record['image_name']}."
+        )
     camera = Camera(
         colmap_id=record["uid"],
         R=np.asarray(record["R"], dtype=np.float32),
         T=np.asarray(record["T"], dtype=np.float32),
-        FoVx=float(record["FoVx"]),
-        FoVy=float(record["FoVy"]),
-        image=torch.zeros(3, record["height"], record["width"]),
+        FoVx=focal2fov(fx, width),
+        FoVy=focal2fov(fy, height),
+        image=torch.zeros(3, height, width),
         gt_alpha_mask=None,
         image_name=record["image_name"],
         uid=record["uid"],
         data_device=device,
+    )
+    camera.fx = fx
+    camera.fy = fy
+    camera.cx = cx
+    camera.cy = cy
+    camera.projection_matrix = getProjectionMatrixFromIntrinsics(
+        znear=camera.znear,
+        zfar=camera.zfar,
+        fx=fx,
+        fy=fy,
+        cx=cx,
+        cy=cy,
+        width=width,
+        height=height,
+    ).transpose(0, 1).to(camera.world_view_transform.device)
+    camera.full_proj_transform = (
+        camera.world_view_transform.unsqueeze(0)
+        .bmm(camera.projection_matrix.unsqueeze(0))
+        .squeeze(0)
     )
     return camera
 

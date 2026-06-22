@@ -32,35 +32,56 @@ def main():
     job_dir = Path(args.job_dir).resolve()
     checkpoint = Path(args.checkpoint).resolve()
     dust3r_checkpoint = Path(args.dust3r_checkpoint).resolve()
+    job_path = job_dir / "viewcrafter_job.json"
+    if not job_path.is_file():
+        raise FileNotFoundError(f"Missing ViewCrafter job: {job_path}")
+    job = json.loads(job_path.read_text())
+    profiles = {
+        "ViewCrafter_25_512": {
+            "resolution": [320, 512],
+            "load_size": 512,
+            "force_1024": False,
+            "config": "inference_pvd_512.yaml",
+        },
+        "ViewCrafter_25_sparse": {
+            "resolution": [576, 1024],
+            "load_size": 1024,
+            "force_1024": True,
+            "config": "inference_pvd_1024.yaml",
+        },
+    }
+    expected_name = job.get("checkpoint_name")
+    if expected_name not in profiles:
+        raise ValueError(
+            f"Unsupported ViewCrafter profile {expected_name!r}. "
+            f"Expected one of {sorted(profiles)}."
+        )
+    profile = profiles[expected_name]
     config = (
         Path(args.config).resolve()
         if args.config
-        else root / "configs" / "inference_pvd_512.yaml"
+        else root / "configs" / profile["config"]
     )
-    job_path = job_dir / "viewcrafter_job.json"
-
     required = {
         "ViewCrafter root": root / "viewcrafter.py",
-        "job": job_path,
         "ViewCrafter checkpoint": checkpoint,
         "DUSt3R checkpoint": dust3r_checkpoint,
-        "512 config": config,
+        "ViewCrafter config": config,
     }
-    missing = [f"{label}: {path}" for label, path in required.items() if not path.exists()]
+    missing = [
+        f"{label}: {path}"
+        for label, path in required.items()
+        if not path.exists()
+    ]
     if missing:
-        raise FileNotFoundError("Missing ViewCrafter inputs:\n" + "\n".join(missing))
-
-    job = json.loads(job_path.read_text())
-    expected_name = job.get("checkpoint_name")
-    if expected_name != "ViewCrafter_25_512":
-        raise ValueError(
-            f"Job expects {expected_name!r}; this bridge is configured for "
-            "ViewCrafter_25_512."
+        raise FileNotFoundError(
+            "Missing ViewCrafter inputs:\n" + "\n".join(missing)
         )
     height, width = job["resolution"]
-    if [height, width] != [320, 512]:
+    if [height, width] != profile["resolution"]:
         raise ValueError(
-            f"ViewCrafter_25_512 requires [320, 512], got {[height, width]}."
+            f"{expected_name} requires {profile['resolution']}, "
+            f"got {[height, width]}."
         )
 
     minimum_teachers = int(job["frame_filter"]["minimum_total_teachers"])
@@ -126,7 +147,11 @@ def main():
                 raise ValueError("ViewCrafter needs at least two sparse views.")
             # Upstream forces the 1024 path. The 512 checkpoint instead needs
             # DUSt3R inputs at its native 512 preprocessing resolution.
-            images = load_images(image_files, size=512, force_1024=False)
+            images = load_images(
+                image_files,
+                size=profile["load_size"],
+                force_1024=profile["force_1024"],
+            )
             originals = []
             for image in images:
                 tensor = (image["img_ori"] + 1.0) / 2.0
@@ -208,7 +233,14 @@ def main():
                 start = clip_index * (self.opts.video_length - 1)
                 clip = renderings[start:start + self.opts.video_length]
                 clips.append(self.run_diffusion(clip))
-            return clips, c2ws, interpolated_c2ws
+            return (
+                clips,
+                c2ws,
+                interpolated_c2ws,
+                trajectory,
+                render_h,
+                render_w,
+            )
 
     official_parser = get_parser()
     opts = official_parser.parse_args([])
@@ -232,9 +264,22 @@ def main():
     Path(opts.save_dir).mkdir(parents=True, exist_ok=True)
 
     model = ScaffoldViewCrafter(opts)
-    clips, dust_input_c2ws, dust_trajectory_c2ws = (
+    (
+        clips,
+        dust_input_c2ws,
+        dust_trajectory_c2ws,
+        dust_trajectory_cameras,
+        dust_render_h,
+        dust_render_w,
+    ) = (
         model.generate_sparse_clips()
     )
+    if len(dust_trajectory_c2ws) != len(dust_trajectory_cameras):
+        raise RuntimeError(
+            "ViewCrafter pose and calibrated-camera trajectories have "
+            f"different lengths: {len(dust_trajectory_c2ws)} vs "
+            f"{len(dust_trajectory_cameras)}."
+        )
     expected_generated_clips = len(job["inputs"]) - 1
     if len(clips) != expected_generated_clips:
         raise RuntimeError(
@@ -250,6 +295,34 @@ def main():
         path.unlink()
 
     teacher_count = 0
+
+    def frame_intrinsics(trajectory_index):
+        focal = (
+            dust_trajectory_cameras.focal_length[trajectory_index]
+            .detach().cpu().numpy().reshape(-1)
+        )
+        principal = (
+            dust_trajectory_cameras.principal_point[trajectory_index]
+            .detach().cpu().numpy().reshape(-1)
+        )
+        if focal.size == 1:
+            focal = np.repeat(focal, 2)
+        if principal.size != 2 or focal.size != 2:
+            raise RuntimeError(
+                "Unexpected ViewCrafter trajectory intrinsics shape: "
+                f"focal={focal.shape}, principal={principal.shape}."
+            )
+        scale_x = width / float(dust_render_w)
+        scale_y = height / float(dust_render_h)
+        fx, fy = float(focal[0] * scale_x), float(focal[1] * scale_y)
+        cx = float(principal[0] * scale_x)
+        cy = float(principal[1] * scale_y)
+        if min(fx, fy) <= 0 or not (0 <= cx <= width and 0 <= cy <= height):
+            raise RuntimeError(
+                "Invalid calibrated ViewCrafter intrinsics after resize: "
+                f"fx={fx}, fy={fy}, cx={cx}, cy={cy}, size={width}x{height}."
+            )
+        return fx, fy, cx, cy
 
     def camera_center(record):
         rotation = np.asarray(record["R"], dtype=np.float64)
@@ -308,6 +381,7 @@ def main():
         )
 
     quality_report = []
+    exported_intrinsics = []
 
     def frame_quality_records(clip_tensor, candidate_indices):
         frames = clip_tensor.detach().float()
@@ -433,6 +507,7 @@ def main():
             aligned_translation = (
                 -aligned_rotation.T @ aligned_position
             ).astype(np.float32)
+            fx, fy, cx, cy = frame_intrinsics(trajectory_index)
             filename = (
                 f"clip_{clip_index:02d}_frame_{frame_index:02d}.png"
             )
@@ -444,6 +519,20 @@ def main():
             record = dict(teacher)
             record["R"] = aligned_rotation.tolist()
             record["T"] = aligned_translation.tolist()
+            record["height"] = int(height)
+            record["width"] = int(width)
+            record["fx"] = fx
+            record["fy"] = fy
+            record["cx"] = cx
+            record["cy"] = cy
+            record["FoVx"] = float(2.0 * np.arctan(width / (2.0 * fx)))
+            record["FoVy"] = float(2.0 * np.arctan(height / (2.0 * fy)))
+            exported_intrinsics.append({
+                "fx": fx,
+                "fy": fy,
+                "cx": cx,
+                "cy": cy,
+            })
             record["quality"] = next(
                 item for item in records
                 if item["frame_index"] == frame_index
@@ -456,6 +545,15 @@ def main():
             )
             teacher_count += 1
 
+    intrinsics_summary = {}
+    if exported_intrinsics:
+        for key in ("fx", "fy", "cx", "cy"):
+            values = [item[key] for item in exported_intrinsics]
+            intrinsics_summary[key] = {
+                "minimum": float(min(values)),
+                "maximum": float(max(values)),
+                "mean": float(np.mean(values)),
+            }
     (job_dir / "generation_complete.json").write_text(json.dumps({
         "signature": job["signature"],
         "teacher_count": teacher_count,
@@ -468,6 +566,8 @@ def main():
         "prompt": args.prompt,
         "camera_alignment_rmse": alignment_rmse,
         "normalized_camera_alignment_error": normalized_alignment_error,
+        "intrinsics_source": "viewcrafter_pytorch3d_trajectory",
+        "intrinsics_summary": intrinsics_summary,
         "quality_report": quality_report,
     }, indent=2))
     print(

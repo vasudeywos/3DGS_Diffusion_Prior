@@ -113,6 +113,11 @@ Place:
 The bridge uses `configs/inference_pvd_512.yaml`, `height=320`, `width=512`,
 `video_length=25`, and `perframe_ae=True`.
 
+Each exported teacher now carries the exact focal length and principal point
+from ViewCrafter's PyTorch3D trajectory, scaled through the final output
+resize. Scaffold-GS renders the teacher supervision with that calibrated
+projection instead of stretching the teacher to an inherited COLMAP FOV.
+
 Run the complete pipeline from the Scaffold-GS environment:
 
 ```bash
@@ -124,3 +129,37 @@ python Gauss_Code/run_pipeline.py \
   --enable_densification_phase \
   --gpu 0
 ```
+
+For the required 200-iteration plumbing and parameter-sharing comparison:
+
+```bash
+python Gauss_Code/run_pipeline.py \
+  --source_path /path/to/mipnerf360/bicycle \
+  --output_dir /path/to/output/bicycle_sanity_200 \
+  --viewcrafter_root Gauss_Code/ViewCrafter \
+  --viewcrafter_python ~/miniconda3/envs/viewcrafter/bin/python \
+  --sanity_200 \
+  --gpu 0
+```
+
+This produces `comparison_summary_512.json` containing Stage-1 and distillation
+PSNR, SSIM, and LPIPS for `shared_mlp` and `all`.
+
+To evaluate ViewCrafter's sparse-view-specific 576x1024 checkpoint, place it
+at `checkpoints/model_sparse.ckpt` and rerun into a separate output directory:
+
+```bash
+python Gauss_Code/run_pipeline.py \
+  --source_path /path/to/mipnerf360/bicycle \
+  --output_dir /path/to/output/bicycle_sanity_200 \
+  --viewcrafter_root Gauss_Code/ViewCrafter \
+  --viewcrafter_python ~/miniconda3/envs/viewcrafter/bin/python \
+  --viewcrafter_profile sparse \
+  --skip_stage1 \
+  --sanity_200 \
+  --gpu 0
+```
+
+The second command reuses the exact Stage-1 checkpoint while keeping the
+teacher caches, distillation outputs, and `comparison_summary_sparse.json`
+separate by ViewCrafter profile.

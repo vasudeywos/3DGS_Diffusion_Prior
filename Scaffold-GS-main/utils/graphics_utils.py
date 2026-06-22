@@ -70,6 +70,34 @@ def getProjectionMatrix(znear, zfar, fovX, fovY):
     P[2, 3] = -(zfar * znear) / (zfar - znear)
     return P
 
+def getProjectionMatrixFromIntrinsics(
+    znear,
+    zfar,
+    fx,
+    fy,
+    cx,
+    cy,
+    width,
+    height,
+):
+    """Build the +Z-forward projection used by the Gaussian rasterizer."""
+    if min(fx, fy, width, height) <= 0:
+        raise ValueError("Focal lengths and image dimensions must be positive.")
+
+    P = torch.zeros(4, 4)
+    P[0, 0] = 2.0 * float(fx) / float(width)
+    P[1, 1] = 2.0 * float(fy) / float(height)
+    # ndc2Pix(v, S) = ((v + 1) * S - 1) / 2 in the CUDA rasterizer.
+    # The +1 terms therefore preserve pixel-coordinate principal points.
+    P[0, 2] = (2.0 * float(cx) + 1.0) / float(width) - 1.0
+    P[1, 2] = (2.0 * float(cy) + 1.0) / float(height) - 1.0
+    P[3, 2] = 1.0
+    P[2, 2] = float(zfar) / (float(zfar) - float(znear))
+    P[2, 3] = -(float(zfar) * float(znear)) / (
+        float(zfar) - float(znear)
+    )
+    return P
+
 def fov2focal(fov, pixels):
     return pixels / (2 * math.tan(fov / 2))
 

@@ -608,7 +608,8 @@ def train_distill(
     gaussians.eval()
     test_cameras = scene.getTestCameras()
 
-    l1_total, psnr_total, ssim_total = 0.0, 0.0, 0.0
+    l1_total, psnr_total, ssim_total, lpips_total = 0.0, 0.0, 0.0, 0.0
+    evaluation_lpips = get_lpips_fn()
 
     with torch.no_grad():
         for cam in tqdm(test_cameras, desc="Evaluating"):
@@ -620,6 +621,11 @@ def train_distill(
             l1_total += l1_loss(rendered, gt).item()
             psnr_total += psnr(rendered, gt).mean().item()
             ssim_total += ssim(rendered, gt).item()
+            # Match Scaffold-GS's existing metrics.py convention so Stage 1
+            # and distillation LPIPS values are directly comparable.
+            lpips_total += evaluation_lpips(
+                rendered.unsqueeze(0), gt.unsqueeze(0)
+            ).mean().item()
 
     n = len(test_cameras)
     if n == 0:
@@ -628,6 +634,7 @@ def train_distill(
             "L1": None,
             "PSNR": None,
             "SSIM": None,
+            "LPIPS": None,
             "round": distill_args.round,
             "n_anchors_final": gaussians._anchor.shape[0],
         }
@@ -635,11 +642,13 @@ def train_distill(
     logger.info(f"  L1:   {l1_total / n:.5f}")
     logger.info(f"  PSNR: {psnr_total / n:.4f} dB")
     logger.info(f"  SSIM: {ssim_total / n:.5f}")
+    logger.info(f"  LPIPS:{lpips_total / n:.5f}")
 
     results = {
         "L1": l1_total / n,
         "PSNR": psnr_total / n,
         "SSIM": ssim_total / n,
+        "LPIPS": lpips_total / n,
         "round": distill_args.round,
         "n_anchors_final": gaussians._anchor.shape[0],
     }
