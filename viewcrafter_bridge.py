@@ -32,6 +32,12 @@ def parse_args():
         default=0.15,
         help="Maximum DUSt3R/Scaffold camera RMSE as a fraction of camera radius.",
     )
+    parser.add_argument(
+        "--max_rotation_alignment_error",
+        type=float,
+        default=45.0,
+        help="Maximum mean endpoint camera-axis error in degrees.",
+    )
     parser.add_argument("--prompt", default="Rotating view of a scene")
     parser.add_argument("--dry_run", action="store_true")
     return parser.parse_args()
@@ -458,16 +464,54 @@ def main():
             target_centered.T @ source_centered / source.shape[0]
         )
         u, singular_values, vh = np.linalg.svd(covariance)
-        correction = np.eye(3)
-        if np.linalg.det(u @ vh) < 0:
-            correction[-1, -1] = -1
-        rotation = u @ correction @ vh
         variance = np.mean(np.sum(source_centered ** 2, axis=1))
-        scale = np.sum(singular_values * np.diag(correction)) / max(
-            variance, 1e-12
-        )
-        translation = target_mean - scale * rotation @ source_mean
-        return scale, rotation, translation
+        candidates = []
+        base_determinant = np.linalg.det(u @ vh)
+        for desired_determinant in (1.0, -1.0):
+            correction = np.eye(3)
+            correction[-1, -1] = desired_determinant / base_determinant
+            rotation = u @ correction @ vh
+            scale = np.sum(
+                singular_values * np.diag(correction)
+            ) / max(variance, 1e-12)
+            translation = target_mean - scale * rotation @ source_mean
+            aligned = (
+                scale * (rotation @ source.T).T + translation
+            )
+            rmse = float(np.sqrt(np.mean(np.sum(
+                (aligned - target) ** 2, axis=1
+            ))))
+            candidates.append(
+                (rmse, scale, rotation, translation)
+            )
+        return min(candidates, key=lambda candidate: candidate[0])
+
+    def camera_axis_alignment(world_transform, dust_rotations, target_rotations):
+        """Choose the signed DUSt3R camera basis matching Scaffold cameras."""
+        required_determinant = float(np.sign(np.linalg.det(world_transform)))
+        candidates = []
+        for sx in (-1.0, 1.0):
+            for sy in (-1.0, 1.0):
+                for sz in (-1.0, 1.0):
+                    basis = np.diag([sx, sy, sz])
+                    if np.linalg.det(basis) != required_determinant:
+                        continue
+                    errors = []
+                    for dust_rotation, target_rotation in zip(
+                        dust_rotations, target_rotations
+                    ):
+                        aligned = world_transform @ dust_rotation @ basis
+                        relative = target_rotation.T @ aligned
+                        cosine = np.clip(
+                            (np.trace(relative) - 1.0) / 2.0,
+                            -1.0,
+                            1.0,
+                        )
+                        errors.append(np.degrees(np.arccos(cosine)))
+                    candidates.append(
+                        (float(np.mean(errors)), basis)
+                    )
+        return min(candidates, key=lambda candidate: candidate[0])
 
     source_centers = dust_input_c2ws[:, :3, 3].detach().cpu().numpy()
     target_centers = np.stack([
@@ -478,26 +522,53 @@ def main():
         raise RuntimeError(
             "DUSt3R input camera count does not match the Scaffold-GS job."
         )
-    align_scale, align_rotation, align_translation = similarity_alignment(
+    (
+        alignment_rmse,
+        align_scale,
+        align_rotation,
+        align_translation,
+    ) = similarity_alignment(
         source_centers, target_centers
     )
     aligned_input_centers = (
         align_scale * (align_rotation @ source_centers.T).T
         + align_translation
     )
-    alignment_rmse = float(np.sqrt(np.mean(np.sum(
-        (aligned_input_centers - target_centers) ** 2, axis=1
-    ))))
+    source_rotations = (
+        dust_input_c2ws[:, :3, :3].detach().cpu().numpy()
+    )
+    target_rotations = np.stack([
+        np.asarray(input_record["camera"]["R"], dtype=np.float64)
+        for input_record in job["inputs"]
+    ])
+    rotation_alignment_error, camera_basis = camera_axis_alignment(
+        align_rotation,
+        source_rotations,
+        target_rotations,
+    )
     target_radius = float(np.max(np.linalg.norm(
         target_centers - target_centers.mean(axis=0), axis=1
     )))
     normalized_alignment_error = alignment_rmse / max(target_radius, 1e-8)
+    print(
+        "DUSt3R alignment: normalized center RMSE="
+        f"{normalized_alignment_error:.6f}, mean rotation error="
+        f"{rotation_alignment_error:.3f} degrees, world determinant="
+        f"{np.linalg.det(align_rotation):.0f}, camera basis="
+        f"{np.diag(camera_basis).astype(int).tolist()}."
+    )
     if normalized_alignment_error > args.max_alignment_error:
         raise RuntimeError(
             "DUSt3R camera alignment is unreliable: normalized RMSE "
             f"{normalized_alignment_error:.4f} exceeds "
             f"{args.max_alignment_error:.4f}. Inspect the five ordered inputs "
             "or adjust DUSt3R confidence/background thresholds."
+        )
+    if rotation_alignment_error > args.max_rotation_alignment_error:
+        raise RuntimeError(
+            "DUSt3R camera-axis alignment is unreliable: mean rotation "
+            f"error {rotation_alignment_error:.2f} degrees exceeds "
+            f"{args.max_rotation_alignment_error:.2f} degrees."
         )
 
     quality_report = []
@@ -618,7 +689,7 @@ def main():
                 .detach().cpu().numpy()
             )
             aligned_rotation = (
-                align_rotation @ dust_pose[:3, :3]
+                align_rotation @ dust_pose[:3, :3] @ camera_basis
             ).astype(np.float32)
             aligned_position = (
                 align_scale * align_rotation @ dust_pose[:3, 3]
@@ -686,6 +757,9 @@ def main():
         "prompt": args.prompt,
         "camera_alignment_rmse": alignment_rmse,
         "normalized_camera_alignment_error": normalized_alignment_error,
+        "mean_rotation_alignment_error_degrees": rotation_alignment_error,
+        "alignment_world_determinant": float(np.linalg.det(align_rotation)),
+        "alignment_camera_basis": camera_basis.tolist(),
         "intrinsics_source": "viewcrafter_pytorch3d_trajectory",
         "intrinsics_summary": intrinsics_summary,
         "quality_report": quality_report,
