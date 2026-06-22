@@ -205,7 +205,9 @@ def main():
                 try:
                     for start in range(0, total_views, chunk_size):
                         end = min(start + chunk_size, total_views)
-                        chunk_cameras = camera_traj[start:end]
+                        # PyTorch3D 0.7.5 PerspectiveCameras does not support
+                        # Python slice objects; it accepts explicit index lists.
+                        chunk_cameras = camera_traj[list(range(start, end))]
                         renderer = setup_renderer(
                             chunk_cameras,
                             image_size=(render_h, render_w),
