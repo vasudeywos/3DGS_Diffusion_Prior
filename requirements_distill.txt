@@ -1,0 +1,9 @@
+# Install in the Scaffold-GS environment after its CUDA extensions are built.
+accelerate>=0.25
+diffusers>=0.25
+lpips>=0.1.4
+Pillow>=9.0
+safetensors>=0.4
+timm>=0.9
+tqdm>=4.64
+transformers>=4.36
