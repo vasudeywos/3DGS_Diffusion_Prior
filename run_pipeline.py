@@ -4,10 +4,10 @@ run_pipeline.py
 Convenience runner for the sparse-view distillation pipeline.
 
 Stage 0: Select a reproducible sparse train split       → split manifests
-Stage 1: Train ScaffoldGS on 5 sparse views          → Checkpoint_A
-Stage 2: Sample novel poses (elliptical path)        → novel_cameras
-Stage 3: Generate teacher images (SD1.5+ControlNet)  → teacher_cache/round1/
-Stage 4: Distillation fine-tuning                    → Checkpoint_B
+Stage 1: Train ScaffoldGS on 5 sparse views             → Checkpoint_A
+Stage 2: Prepare ellipse-ordered trajectory job          → ViewCrafter job
+Stage 3: Generate ViewCrafter_25_512 trajectory teachers → teacher cache
+Stage 4: Distillation fine-tuning                        → Checkpoint_B
 Stage 4b (optional): Second round with Checkpoint_B  → Checkpoint_C
 
 Usage:
@@ -55,9 +55,31 @@ def main():
     parser.add_argument("--skip_stage1", action="store_true")
     parser.add_argument("--round", type=int, default=1)
     parser.add_argument("--start_checkpoint", type=str, default=None)
-    parser.add_argument("--n_novel_views", type=int, default=40)
     parser.add_argument("--distill_iterations", type=int, default=10000)
+    parser.add_argument("--viewcrafter_root", type=str, default=None)
+    parser.add_argument("--viewcrafter_python", type=str, default=None)
+    parser.add_argument("--viewcrafter_checkpoint", type=str, default=None)
+    parser.add_argument("--dust3r_checkpoint", type=str, default=None)
+    parser.add_argument("--viewcrafter_config", type=str, default=None)
+    parser.add_argument("--viewcrafter_min_frames_per_clip", type=int, default=8)
+    parser.add_argument("--viewcrafter_max_frames_per_clip", type=int, default=12)
+    parser.add_argument("--viewcrafter_max_pair_angle", type=float, default=110.0)
+    parser.add_argument("--viewcrafter_min_view_cosine", type=float, default=0.2)
+    parser.add_argument(
+        "--viewcrafter_max_normalized_baseline", type=float, default=1.5
+    )
+    parser.add_argument(
+        "--viewcrafter_max_radial_difference", type=float, default=0.4
+    )
+    parser.add_argument("--viewcrafter_ddim_steps", type=int, default=50)
+    parser.add_argument("--viewcrafter_bg_trd", type=float, default=0.2)
+    parser.add_argument(
+        "--viewcrafter_max_alignment_error", type=float, default=0.15
+    )
+    parser.add_argument("--viewcrafter_seed", type=int, default=123)
+    parser.add_argument("--skip_viewcrafter", action="store_true")
     parser.add_argument("--lambda_teacher", type=float, default=0.2)
+    parser.add_argument("--lambda_trajectory", type=float, default=0.03)
     parser.add_argument("--lambda_anchor_reg", type=float, default=0.01)
     parser.add_argument(
         "--parameter_mode",
@@ -68,15 +90,49 @@ def main():
     parser.add_argument("--position_lr_final", type=float, default=1e-6)
     parser.add_argument("--offset_lr_init", type=float, default=1e-3)
     parser.add_argument("--offset_lr_final", type=float, default=5e-5)
+    parser.add_argument("--enable_densification_phase", action="store_true")
+    parser.add_argument("--densification_iterations", type=int, default=4000)
+    parser.add_argument("--densification_teacher_weight", type=float, default=0.08)
+    parser.add_argument(
+        "--densification_trajectory_weight", type=float, default=0.01
+    )
     parser.add_argument("--dry_run", action="store_true")
     args = parser.parse_args()
 
     args.source_path = os.path.abspath(args.source_path)
     args.output_dir = os.path.abspath(args.output_dir)
     stage1_output = os.path.join(args.output_dir, "stage1")
-    distill_output = os.path.join(args.output_dir, f"distill_round{args.round}")
+    distill_output = os.path.join(
+        args.output_dir, f"distill_round{args.round}_stable"
+    )
+    densified_output = os.path.join(
+        args.output_dir, f"distill_round{args.round}_densified"
+    )
     teacher_cache = os.path.join(args.output_dir, "teacher_cache")
+    round_teacher_cache = os.path.join(
+        teacher_cache, f"round{args.round}"
+    )
     distill_script = str(SCRIPT_DIR / "train_distill.py")
+    viewcrafter_root = Path(
+        args.viewcrafter_root or SCRIPT_DIR / "ViewCrafter"
+    ).expanduser().resolve()
+    viewcrafter_python = str(Path(
+        args.viewcrafter_python
+        or Path.home() / "miniconda3/envs/viewcrafter/bin/python"
+    ).expanduser().resolve())
+    viewcrafter_checkpoint = Path(
+        args.viewcrafter_checkpoint
+        or viewcrafter_root / "checkpoints/model.ckpt"
+    ).expanduser().resolve()
+    dust3r_checkpoint = Path(
+        args.dust3r_checkpoint
+        or viewcrafter_root
+        / "checkpoints/DUSt3R_ViTLarge_BaseDecoder_512_dpt.pth"
+    ).expanduser().resolve()
+    viewcrafter_config = Path(
+        args.viewcrafter_config
+        or viewcrafter_root / "configs/inference_pvd_512.yaml"
+    ).expanduser().resolve()
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -133,6 +189,60 @@ def main():
         print("Skipping Stage 1 (--skip_stage1 set).")
 
     # ------------------------------------------------------------------
+    # Stage 2: Prepare ViewCrafter job and matching Scaffold-GS cameras
+    # ------------------------------------------------------------------
+    prepare_cmd = [
+        sys.executable,
+        str(SCRIPT_DIR / "prepare_viewcrafter_job.py"),
+        "--source_path", args.source_path,
+        "--images", args.images,
+        "--train_views_file", train_views_file,
+        "--test_views_file", test_views_file,
+        "--model_path", stage1_output,
+        "--stage1_iteration", "30000",
+        "--output_dir", round_teacher_cache,
+        "--video_length", "25",
+        "--min_frames_per_clip", str(args.viewcrafter_min_frames_per_clip),
+        "--max_frames_per_clip", str(args.viewcrafter_max_frames_per_clip),
+        "--interior_frame_start", "4",
+        "--interior_frame_end", "21",
+        "--max_pair_angle", str(args.viewcrafter_max_pair_angle),
+        "--min_view_cosine", str(args.viewcrafter_min_view_cosine),
+        "--max_normalized_baseline",
+        str(args.viewcrafter_max_normalized_baseline),
+        "--max_radial_difference",
+        str(args.viewcrafter_max_radial_difference),
+        "--viewcrafter_height", "320",
+        "--viewcrafter_width", "512",
+        "--checkpoint_name", "ViewCrafter_25_512",
+        "--seed", str(args.viewcrafter_seed),
+        "--eval",
+    ]
+    run_cmd(prepare_cmd, dry_run=args.dry_run, cwd=SCRIPT_DIR)
+
+    # ------------------------------------------------------------------
+    # Stage 3: ViewCrafter generation in its isolated environment
+    # ------------------------------------------------------------------
+    if not args.skip_viewcrafter:
+        bridge_cmd = [
+            viewcrafter_python,
+            str(SCRIPT_DIR / "viewcrafter_bridge.py"),
+            "--viewcrafter_root", str(viewcrafter_root),
+            "--job_dir", round_teacher_cache,
+            "--checkpoint", str(viewcrafter_checkpoint),
+            "--dust3r_checkpoint", str(dust3r_checkpoint),
+            "--config", str(viewcrafter_config),
+            "--device", "cuda:0",
+            "--ddim_steps", str(args.viewcrafter_ddim_steps),
+            "--bg_trd", str(args.viewcrafter_bg_trd),
+            "--max_alignment_error",
+            str(args.viewcrafter_max_alignment_error),
+        ]
+        run_cmd(bridge_cmd, dry_run=args.dry_run, cwd=SCRIPT_DIR)
+    else:
+        print("Skipping Stage 3 (--skip_viewcrafter set).")
+
+    # ------------------------------------------------------------------
     # Stage 4: Distillation fine-tuning
     # ------------------------------------------------------------------
     print("=" * 60)
@@ -153,8 +263,8 @@ def main():
         "--distill_output", distill_output,
         "--teacher_cache_dir", teacher_cache,
         "--distill_iterations", str(args.distill_iterations),
-        "--n_novel_views", str(args.n_novel_views),
         "--lambda_teacher", str(args.lambda_teacher),
+        "--lambda_trajectory", str(args.lambda_trajectory),
         "--lambda_anchor_reg", str(args.lambda_anchor_reg),
         "--parameter_mode", args.parameter_mode,
         "--position_lr_init", str(args.position_lr_init),
@@ -168,10 +278,45 @@ def main():
     ] + start_ckpt_args
     run_cmd(distill_cmd, dry_run=args.dry_run)
 
+    if args.enable_densification_phase:
+        stable_checkpoint = os.path.join(
+            distill_output,
+            f"chkpnt{args.distill_iterations}_round{args.round}.pth",
+        )
+        densify_cmd = [
+            sys.executable, distill_script,
+            "--source_path", args.source_path,
+            "--images", args.images,
+            "--train_views_file", train_views_file,
+            "--test_views_file", test_views_file,
+            "--model_path", stage1_output,
+            "--distill_output", densified_output,
+            "--teacher_cache_dir", teacher_cache,
+            "--distill_iterations", str(args.densification_iterations),
+            "--distill_densify_until", str(args.densification_iterations),
+            "--lambda_teacher", str(args.densification_teacher_weight),
+            "--lambda_trajectory",
+            str(args.densification_trajectory_weight),
+            "--lambda_anchor_reg", "0.0",
+            "--parameter_mode", "all",
+            "--position_lr_init", str(args.position_lr_final),
+            "--position_lr_final", str(args.position_lr_final * 0.1),
+            "--offset_lr_init", str(args.offset_lr_final),
+            "--offset_lr_final", str(args.offset_lr_final * 0.2),
+            "--start_checkpoint", stable_checkpoint,
+            "--stage1_iteration", "30000",
+            "--round", str(args.round),
+            "--gpu", args.gpu,
+            "--eval",
+        ]
+        run_cmd(densify_cmd, dry_run=args.dry_run)
+
     print("\n" + "=" * 60)
     print("Pipeline complete.")
     print(f"Stage 1 output:     {stage1_output}")
     print(f"Distill output:     {distill_output}")
+    if args.enable_densification_phase:
+        print(f"Densified output:   {densified_output}")
     print(f"Teacher cache:      {teacher_cache}")
     print("=" * 60)
 

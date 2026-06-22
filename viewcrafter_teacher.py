@@ -17,7 +17,7 @@ from scene.cameras import Camera
 from utils.graphics_utils import getProjectionMatrix
 
 
-SCHEMA_VERSION = 1
+SCHEMA_VERSION = 2
 
 
 def _camera_c2w(camera):
@@ -51,7 +51,50 @@ def order_cameras_on_ellipse(cameras):
     y = relative @ (ellipse["axis_b"] / (ellipse["semi_b"] + 1e-8))
     angles = np.mod(np.arctan2(y, x), 2 * np.pi)
     order = np.argsort(angles)
+    # ViewCrafter interpolation is an open chain, not a closed loop. Start just
+    # after the largest cyclic gap so the one omitted pair is the least
+    # plausible bridge.
+    ordered_angles = angles[order]
+    cyclic_gaps = np.diff(np.r_[ordered_angles, ordered_angles[0] + 2 * np.pi])
+    cut = (int(np.argmax(cyclic_gaps)) + 1) % len(order)
+    order = np.roll(order, -cut)
     return [cameras[index] for index in order], focus, ellipse
+
+
+def camera_pair_metrics(camera_a, camera_b, focus, ellipse):
+    """Measure whether an ordered pair is safe for open-scene interpolation."""
+    position_a = camera_a.camera_center.detach().cpu().numpy()
+    position_b = camera_b.camera_center.detach().cpu().numpy()
+    direction_a = np.asarray(camera_a.R, dtype=np.float32)[:, 2]
+    direction_b = np.asarray(camera_b.R, dtype=np.float32)[:, 2]
+    direction_cosine = float(np.dot(direction_a, direction_b))
+
+    scene_radius = max(
+        float(ellipse["semi_a"]), float(ellipse["semi_b"]), 1e-8
+    )
+    normalized_baseline = float(
+        np.linalg.norm(position_b - position_a) / scene_radius
+    )
+    radius_a = float(np.linalg.norm(position_a - focus))
+    radius_b = float(np.linalg.norm(position_b - focus))
+    radial_difference = abs(radius_a - radius_b) / max(
+        0.5 * (radius_a + radius_b), 1e-8
+    )
+
+    axis_a = ellipse["axis_a"] / (ellipse["semi_a"] + 1e-8)
+    axis_b = ellipse["axis_b"] / (ellipse["semi_b"] + 1e-8)
+    angles = []
+    for position in (position_a, position_b):
+        relative = position - ellipse["centre"]
+        angles.append(np.arctan2(relative @ axis_b, relative @ axis_a))
+    angular_gap = abs(np.angle(np.exp(1j * (angles[1] - angles[0]))))
+
+    return {
+        "angular_gap_degrees": float(np.degrees(angular_gap)),
+        "view_direction_cosine": direction_cosine,
+        "normalized_baseline": normalized_baseline,
+        "relative_radial_difference": float(radial_difference),
+    }
 
 
 def _project_to_rotation(matrix):
@@ -105,14 +148,18 @@ def interpolate_camera(camera_a, camera_b, t, uid, name):
     return camera
 
 
-def selected_frame_indices(video_length, frames_per_clip):
-    """Choose novel internal frames; real-view endpoints are not teachers."""
+def selected_frame_indices(video_length, interior_start=4, interior_end=21):
+    """Return candidate interior frames; quality filtering happens after generation."""
     if video_length < 3:
         raise ValueError("ViewCrafter video length must be at least 3.")
-    available = np.arange(1, video_length - 1)
-    count = min(int(frames_per_clip), len(available))
-    positions = np.linspace(0, len(available) - 1, count)
-    return sorted({int(available[round(position)]) for position in positions})
+    start = max(1, int(interior_start))
+    end = min(video_length - 2, int(interior_end))
+    if start > end:
+        raise ValueError(
+            f"Invalid interior frame range [{start}, {end}] for "
+            f"video_length={video_length}."
+        )
+    return list(range(start, end + 1))
 
 
 def viewcrafter_frame_t(frame_index, video_length):
@@ -159,11 +206,11 @@ def cache_is_complete(cache_dir):
     except (OSError, json.JSONDecodeError):
         return False
     signature = compute_job_signature(job)
-    expected = sum(len(clip["teachers"]) for clip in job["clips"])
+    expected = int(complete.get("teacher_count", 0))
     return (
         job.get("signature") == signature
         and complete.get("signature") == signature
-        and complete.get("teacher_count") == expected
+        and expected >= int(job["frame_filter"]["minimum_total_teachers"])
         and len(list((cache_dir / "teacher_images").glob("*.png"))) == expected
         and len(list((cache_dir / "metadata").glob("*.json"))) == expected
     )
@@ -200,18 +247,30 @@ class ViewCrafterTeacherDataset:
             )
         self.device = device
         self.pairs = []
+        self.clips = {}
         for path in sorted((cache_dir / "metadata").glob("*.json")):
             record = json.loads(path.read_text())
             teacher_path = Path(record["teacher_path"])
             if not teacher_path.is_absolute():
                 teacher_path = cache_dir / teacher_path
-            self.pairs.append((record_to_camera(record, device), teacher_path))
+            item = (record_to_camera(record, device), teacher_path, record)
+            self.pairs.append(item)
+            self.clips.setdefault(record["clip_index"], []).append(item)
+        for items in self.clips.values():
+            items.sort(key=lambda item: item[2]["frame_index"])
+        self.adjacent_pairs = [
+            (items[index], items[index + 1])
+            for items in self.clips.values()
+            for index in range(len(items) - 1)
+        ]
+        if not self.adjacent_pairs:
+            raise RuntimeError("ViewCrafter cache contains no adjacent teacher pairs.")
 
     def __len__(self):
         return len(self.pairs)
 
     def __getitem__(self, index):
-        camera, path = self.pairs[index]
+        camera, path, _ = self.pairs[index]
         with Image.open(path) as image:
             image = image.convert("RGB").resize(
                 (camera.image_width, camera.image_height),
@@ -223,3 +282,18 @@ class ViewCrafterTeacherDataset:
     def sample(self):
         index = torch.randint(0, len(self.pairs), (1,)).item()
         return self[index]
+
+    def _load_item(self, item):
+        camera, path, _ = item
+        with Image.open(path) as image:
+            image = image.convert("RGB").resize(
+                (camera.image_width, camera.image_height),
+                Image.Resampling.LANCZOS,
+            )
+            tensor = pil_to_tensor(image, self.device)
+        return camera, tensor
+
+    def sample_adjacent(self):
+        index = torch.randint(0, len(self.adjacent_pairs), (1,)).item()
+        first, second = self.adjacent_pairs[index]
+        return self._load_item(first), self._load_item(second)

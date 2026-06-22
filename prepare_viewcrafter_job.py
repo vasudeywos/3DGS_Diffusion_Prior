@@ -20,6 +20,7 @@ from scene import GaussianModel, Scene
 from viewcrafter_teacher import (
     SCHEMA_VERSION,
     camera_to_record,
+    camera_pair_metrics,
     compute_job_signature,
     interpolate_camera,
     order_cameras_on_ellipse,
@@ -63,12 +64,26 @@ def main():
     parser.add_argument("--stage1_iteration", type=int, default=30000)
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--video_length", type=int, default=25)
-    parser.add_argument("--frames_per_clip", type=int, default=12)
+    parser.add_argument("--min_frames_per_clip", type=int, default=8)
+    parser.add_argument("--max_frames_per_clip", type=int, default=12)
+    parser.add_argument("--interior_frame_start", type=int, default=4)
+    parser.add_argument("--interior_frame_end", type=int, default=21)
+    parser.add_argument("--max_pair_angle", type=float, default=110.0)
+    parser.add_argument("--min_view_cosine", type=float, default=0.2)
+    parser.add_argument("--max_normalized_baseline", type=float, default=1.5)
+    parser.add_argument("--max_radial_difference", type=float, default=0.4)
+    parser.add_argument("--min_compatible_pairs", type=int, default=2)
     parser.add_argument("--viewcrafter_height", type=int, default=320)
     parser.add_argument("--viewcrafter_width", type=int, default=512)
     parser.add_argument("--checkpoint_name", default="ViewCrafter_25_512")
     parser.add_argument("--seed", type=int, default=123)
     args = merge_stage_config(parser.parse_args())
+    if args.min_frames_per_clip < 2:
+        raise ValueError("--min_frames_per_clip must be at least 2.")
+    if args.max_frames_per_clip < args.min_frames_per_clip:
+        raise ValueError(
+            "--max_frames_per_clip must be >= --min_frames_per_clip."
+        )
 
     dataset = model.extract(args)
     gaussians = GaussianModel(
@@ -105,14 +120,42 @@ def main():
             "index": index,
             "path": str(path.relative_to(output_dir)),
             "source_image_name": camera.image_name,
+            "camera": camera_to_record(camera, -1, -1),
         })
 
     frame_indices = selected_frame_indices(
-        args.video_length, args.frames_per_clip
+        args.video_length,
+        args.interior_frame_start,
+        args.interior_frame_end,
     )
+    if len(frame_indices) < args.min_frames_per_clip:
+        raise ValueError(
+            f"Interior range provides only {len(frame_indices)} candidates, "
+            f"fewer than min_frames_per_clip={args.min_frames_per_clip}."
+        )
     clips = []
+    rejected_pairs = []
     uid = 20000
-    for clip_index, (start, end) in enumerate(zip(cameras[:-1], cameras[1:])):
+    for source_segment_index, (start, end) in enumerate(
+        zip(cameras[:-1], cameras[1:])
+    ):
+        metrics = camera_pair_metrics(start, end, focus, ellipse)
+        compatible = (
+            metrics["angular_gap_degrees"] <= args.max_pair_angle
+            and metrics["view_direction_cosine"] >= args.min_view_cosine
+            and metrics["normalized_baseline"] <= args.max_normalized_baseline
+            and metrics["relative_radial_difference"]
+            <= args.max_radial_difference
+        )
+        if not compatible:
+            rejected_pairs.append({
+                "source_segment_index": source_segment_index,
+                "start_image": start.image_name,
+                "end_image": end.image_name,
+                "metrics": metrics,
+            })
+            continue
+        clip_index = len(clips)
         teachers = []
         for frame_index in frame_indices:
             t = viewcrafter_frame_t(frame_index, args.video_length)
@@ -124,10 +167,18 @@ def main():
             uid += 1
         clips.append({
             "clip_index": clip_index,
-            "start_input": clip_index,
-            "end_input": clip_index + 1,
+            "source_segment_index": source_segment_index,
+            "start_input": source_segment_index,
+            "end_input": source_segment_index + 1,
+            "pair_metrics": metrics,
             "teachers": teachers,
         })
+    if len(clips) < args.min_compatible_pairs:
+        raise RuntimeError(
+            f"Only {len(clips)} camera pairs passed compatibility filtering; "
+            f"at least {args.min_compatible_pairs} are required. Rejected: "
+            f"{json.dumps(rejected_pairs, indent=2)}"
+        )
 
     job = {
         "schema_version": SCHEMA_VERSION,
@@ -138,6 +189,23 @@ def main():
         "seed": args.seed,
         "inputs": inputs,
         "clips": clips,
+        "rejected_pairs": rejected_pairs,
+        "pair_filter": {
+            "max_angle_degrees": args.max_pair_angle,
+            "min_view_direction_cosine": args.min_view_cosine,
+            "max_normalized_baseline": args.max_normalized_baseline,
+            "max_relative_radial_difference": args.max_radial_difference,
+        },
+        "frame_filter": {
+            "candidate_range": [
+                args.interior_frame_start, args.interior_frame_end
+            ],
+            "minimum_per_clip": args.min_frames_per_clip,
+            "maximum_per_clip": args.max_frames_per_clip,
+            "minimum_total_teachers": (
+                args.min_frames_per_clip * len(clips)
+            ),
+        },
         "trajectory": {
             "type": "ellipse_ordered_pairwise_interpolation",
             "focus": np.asarray(focus).tolist(),
@@ -148,15 +216,25 @@ def main():
     }
     job["signature"] = compute_job_signature(job)
     output_dir.mkdir(parents=True, exist_ok=True)
-    (output_dir / "viewcrafter_job.json").write_text(
+    job_path = output_dir / "viewcrafter_job.json"
+    previous_signature = None
+    if job_path.is_file():
+        try:
+            previous_signature = json.loads(
+                job_path.read_text()
+            ).get("signature")
+        except json.JSONDecodeError:
+            pass
+    job_path.write_text(
         json.dumps(job, indent=2)
     )
     complete = output_dir / "generation_complete.json"
-    if complete.exists():
+    if previous_signature != job["signature"] and complete.exists():
         complete.unlink()
     print(
-        f"Prepared {len(inputs)} ordered inputs, {len(clips)} clips, and "
-        f"{sum(len(clip['teachers']) for clip in clips)} teacher cameras."
+        f"Prepared {len(inputs)} ordered inputs and {len(clips)} compatible "
+        f"clips ({len(rejected_pairs)} rejected). Each clip has "
+        f"{len(frame_indices)} candidate interior frames before quality filtering."
     )
 
 

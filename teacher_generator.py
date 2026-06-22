@@ -1,6 +1,13 @@
 """
 teacher_generator.py
 
+Legacy SD1.5 + ControlNet teacher backend.
+
+The active training pipeline now uses ViewCrafter through
+prepare_viewcrafter_job.py and viewcrafter_bridge.py. This file is retained only
+for reproducibility of the earlier image-wise baseline and is not imported by
+run_pipeline.py or train_distill.py.
+
 Generates teacher images from ScaffoldGS renders using:
   - SD 1.5 img2img (base)
   - ControlNet depth conditioning (geometry preservation)

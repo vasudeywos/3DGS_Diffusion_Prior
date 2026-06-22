@@ -1,12 +1,11 @@
 """
 train_distill.py
 
-Stage 4: Distillation fine-tuning of ScaffoldGS with diffusion teacher supervision.
+Stage 4: Distillation fine-tuning with ViewCrafter trajectory supervision.
 
 This is the core experiment:
   - A ScaffoldGS checkpoint trained on 5 views (Checkpoint_A) is loaded.
-  - Novel camera views are sampled along an elliptical path.
-  - Teacher images are generated (or loaded from cache) using SD1.5 + ControlNet depth.
+  - ViewCrafter teachers and matching cameras are loaded from an offline cache.
   - ScaffoldGS is fine-tuned with:
       L_total = L_real + λ_teacher * L_teacher + λ_anchor_reg * L_anchor_reg
 
@@ -21,11 +20,10 @@ Usage:
         --distill_output output/bicycle/stage2 \
         --teacher_cache_dir teacher_cache/bicycle \
         --distill_iterations 10000 \
-        --n_novel_views 40 \
         --lambda_teacher 0.2 \
+        --lambda_trajectory 0.03 \
         --lambda_lpips 0.1 \
         --lambda_anchor_reg 0.01 \
-        --teacher_strength 0.55 \
         --round 1
 
 For round 2 (iterative refinement):
@@ -61,14 +59,7 @@ from utils.general_utils import safe_state
 from arguments import ModelParams, PipelineParams, OptimizationParams
 
 # Project imports
-from novel_view_sampler import sample_novel_poses
-from teacher_generator import (
-    TeacherGenerator,
-    TeacherDataset,
-    teacher_cache_is_valid,
-    teacher_generation_settings,
-    unload_teacher_models,
-)
+from viewcrafter_teacher import ViewCrafterTeacherDataset, cache_is_complete
 
 lpips_fn = None
 
@@ -102,9 +93,8 @@ def anchor_regularisation_loss(
     Soft stiffness penalty on anchor positions and offsets.
     Penalises large deviations from the Stage 1 geometry.
 
-    This is the key regulariser that lets geometry adapt while absorbing
-    diffusion gradients smoothly through the MLP rather than shattering
-    individual Gaussian positions.
+    This regulariser lets geometry adapt while discouraging noisy
+    ViewCrafter supervision from shattering individual anchor positions.
 
     L_anchor_reg = mean(|| _anchor - anchor_init ||^2)
                  + 0.1 * mean(|| _offset - offset_init ||^2)
@@ -149,6 +139,11 @@ def teacher_distillation_loss(
     perceptual = get_lpips_fn()(rendered_lpips, teacher_lpips).mean()
 
     return l1 + lambda_lpips * perceptual
+
+
+def trajectory_delta_loss(render_a, render_b, teacher_a, teacher_b):
+    """Match local cross-view change along the static-scene camera path."""
+    return l1_loss(render_b - render_a, teacher_b - teacher_a)
 
 
 # ---------------------------------------------------------------------------
@@ -232,20 +227,6 @@ def _point_cloud_iteration_dir(model_path: str, iteration: int, round_id=None):
     return None
 
 
-def _checkpoint_cache_tag(point_cloud_dir: str) -> str:
-    entries = []
-    for filename in (
-        "point_cloud.ply",
-        "opacity_mlp.pt",
-        "cov_mlp.pt",
-        "color_mlp.pt",
-    ):
-        path = os.path.join(point_cloud_dir, filename)
-        stat = os.stat(path)
-        entries.append(f"{filename}:{stat.st_size}:{stat.st_mtime_ns}")
-    return "|".join(entries)
-
-
 def configure_trainable_parameters(gaussians, mode: str, logger=None):
     """Select which Scaffold-GS parameter families may absorb teacher errors."""
     allowed_by_mode = {
@@ -315,7 +296,6 @@ def train_distill(
         dataset_args.add_color_dist,
     )
 
-    loaded_state_dir = None
     if distill_args.start_checkpoint:
         scene = Scene(dataset_args, gaussians, shuffle=False)
         logger.info(f"Loading checkpoint: {distill_args.start_checkpoint}")
@@ -338,7 +318,6 @@ def train_distill(
         logger.info(f"Loading distillation state from {point_cloud_dir}")
         gaussians.load_ply_sparse_gaussian(os.path.join(point_cloud_dir, "point_cloud.ply"))
         gaussians.load_mlp_checkpoints(point_cloud_dir, mode='split')
-        loaded_state_dir = point_cloud_dir
     else:
         stage1_dir = _point_cloud_iteration_dir(
             dataset_args.model_path,
@@ -351,7 +330,6 @@ def train_distill(
             )
         logger.info(f"Loading Stage 1 ScaffoldGS state from {stage1_dir}")
         scene = Scene(dataset_args, gaussians, load_iteration=distill_args.stage1_iteration, shuffle=False)
-        loaded_state_dir = stage1_dir
 
     # Loaded PLY checkpoints do not restore this value, but anchor and offset
     # learning-rate schedules depend on it.
@@ -396,77 +374,25 @@ def train_distill(
     logger.info(f"Snapshotted {anchor_init.shape[0]} anchors for regularisation.")
 
     # -----------------------------------------------------------------------
-    # 3. Sample novel views and generate/load teacher images
+    # 3. Load pre-generated ViewCrafter trajectory teachers
     # -----------------------------------------------------------------------
-    logger.info("Sampling novel camera poses...")
-    novel_cameras = sample_novel_poses(
-        scene,
-        n_samples=distill_args.n_novel_views,
-        device='cuda',
-        exclude_test_cameras=True,
-    )
-
     teacher_cache = os.path.join(distill_args.teacher_cache_dir, f"round{distill_args.round}")
-
-    # Reuse teachers only when poses, generation settings, and source
-    # checkpoint identity all match.
-    teacher_settings = teacher_generation_settings(
-        distill_args.teacher_strength,
-        distill_args.teacher_guidance_scale,
-        distill_args.teacher_steps,
-        distill_args.teacher_prompt,
-        distill_args.teacher_negative_prompt,
-        distill_args.controlnet_scale,
-        True,
-        distill_args.depth_consistency_threshold,
-        distill_args.teacher_seed,
-        _checkpoint_cache_tag(loaded_state_dir),
+    if not cache_is_complete(teacher_cache):
+        raise RuntimeError(
+            f"ViewCrafter cache is missing or incomplete at {teacher_cache}. "
+            "Run prepare_viewcrafter_job.py and viewcrafter_bridge.py first, "
+            "or use run_pipeline.py to execute all stages."
+        )
+    teacher_dataset = ViewCrafterTeacherDataset(
+        teacher_cache, device="cuda"
     )
-    need_generation = not teacher_cache_is_valid(
-        teacher_cache, novel_cameras, teacher_settings
-    )
-
-    if need_generation:
-        logger.info("Generating teacher images (this may take 30-60 min)...")
-        bg_color = [1, 1, 1] if dataset_args.white_background else [0, 0, 0]
-        background = torch.tensor(bg_color, dtype=torch.float32, device="cuda")
-
-        teacher_gen = TeacherGenerator(device='cuda', use_sdxl=distill_args.use_sdxl)
-        try:
-            teacher_gen.generate_teachers(
-                gaussians=gaussians,
-                pipe_args=pipe_args,
-                novel_cameras=novel_cameras,
-                output_dir=teacher_cache,
-                background=background,
-                strength=distill_args.teacher_strength,
-                guidance_scale=distill_args.teacher_guidance_scale,
-                num_inference_steps=distill_args.teacher_steps,
-                prompt=distill_args.teacher_prompt,
-                negative_prompt=distill_args.teacher_negative_prompt,
-                controlnet_conditioning_scale=distill_args.controlnet_scale,
-                depth_consistency_filter=True,
-                depth_consistency_threshold=distill_args.depth_consistency_threshold,
-                seed=distill_args.teacher_seed,
-                cache_tag=_checkpoint_cache_tag(loaded_state_dir),
-            )
-        finally:
-            teacher_gen.unload()
-    else:
-        logger.info(f"Using cached teacher images from {teacher_cache}")
-    unload_teacher_models()
-
-    # Load teacher dataset
-    teacher_dataset = TeacherDataset(novel_cameras, teacher_cache, device='cuda')
-    minimum_teachers = min(
-        distill_args.min_teacher_views, len(novel_cameras)
-    )
+    minimum_teachers = distill_args.min_teacher_views
     if len(teacher_dataset) < minimum_teachers:
         raise RuntimeError(
             f"Only {len(teacher_dataset)} teacher views passed filtering; "
             f"at least {minimum_teachers} are required. Inspect rendered_rgb, "
             "rendered_depth, and teacher_images, then adjust the pose path or "
-            "--depth_consistency_threshold."
+            "the ViewCrafter job and exported metadata."
         )
 
     logger.info(f"Teacher dataset: {len(teacher_dataset)} pairs.")
@@ -487,7 +413,13 @@ def train_distill(
     progress_bar = tqdm(range(1, iterations + 1), desc="Distillation")
 
     # Counters for logging
-    loss_accum = {"real": 0.0, "teacher": 0.0, "anchor_reg": 0.0, "total": 0.0}
+    loss_accum = {
+        "real": 0.0,
+        "teacher": 0.0,
+        "trajectory": 0.0,
+        "anchor_reg": 0.0,
+        "total": 0.0,
+    }
     count = 0
 
     gaussians.train()
@@ -525,19 +457,42 @@ def train_distill(
         # ------------------------------------------------------------------
         # 4b. Teacher distillation loss (novel views)
         # ------------------------------------------------------------------
-        teacher_cam, teacher_img = teacher_dataset.sample()
-
-        voxel_visible_mask_t = prefilter_voxel(teacher_cam, gaussians, pipe_args, background)
-        render_pkg_teacher = render(
-            teacher_cam, gaussians, pipe_args, background,
-            visible_mask=voxel_visible_mask_t, retain_grad=False
+        (teacher_cam_a, teacher_img_a), (teacher_cam_b, teacher_img_b) = (
+            teacher_dataset.sample_adjacent()
         )
-        rendered_teacher = render_pkg_teacher["render"]
+        rendered_teachers = []
+        for teacher_cam in (teacher_cam_a, teacher_cam_b):
+            visible_mask = prefilter_voxel(
+                teacher_cam, gaussians, pipe_args, background
+            )
+            render_pkg = render(
+                teacher_cam,
+                gaussians,
+                pipe_args,
+                background,
+                visible_mask=visible_mask,
+                retain_grad=False,
+            )
+            rendered_teachers.append(render_pkg["render"])
+        rendered_teacher_a, rendered_teacher_b = rendered_teachers
 
-        L_teacher = teacher_distillation_loss(
-            rendered_teacher,
-            teacher_img,
-            lambda_lpips=distill_args.lambda_lpips,
+        L_teacher = 0.5 * (
+            teacher_distillation_loss(
+                rendered_teacher_a,
+                teacher_img_a,
+                lambda_lpips=distill_args.lambda_lpips,
+            )
+            + teacher_distillation_loss(
+                rendered_teacher_b,
+                teacher_img_b,
+                lambda_lpips=distill_args.lambda_lpips,
+            )
+        )
+        L_trajectory = trajectory_delta_loss(
+            rendered_teacher_a,
+            rendered_teacher_b,
+            teacher_img_a,
+            teacher_img_b,
         )
 
         # ------------------------------------------------------------------
@@ -551,6 +506,7 @@ def train_distill(
         L_total = (
             L_real
             + distill_args.lambda_teacher * L_teacher
+            + distill_args.lambda_trajectory * L_trajectory
             + distill_args.lambda_anchor_reg * L_anchor_reg
         )
 
@@ -599,6 +555,7 @@ def train_distill(
         ema_loss = 0.4 * L_total.item() + 0.6 * ema_loss
         loss_accum["real"] += L_real.item()
         loss_accum["teacher"] += L_teacher.item()
+        loss_accum["trajectory"] += L_trajectory.item()
         loss_accum["anchor_reg"] += L_anchor_reg.item()
         loss_accum["total"] += L_total.item()
         count += 1
@@ -609,6 +566,7 @@ def train_distill(
                 "total": f"{avg['total']:.5f}",
                 "real": f"{avg['real']:.5f}",
                 "teacher": f"{avg['teacher']:.5f}",
+                "path": f"{avg['trajectory']:.5f}",
                 "reg": f"{avg['anchor_reg']:.6f}",
                 "anchors": gaussians._anchor.shape[0],
             })
@@ -718,25 +676,14 @@ class DistillationParams:
         self.offset_lr_init = 1e-3
         self.offset_lr_final = 5e-5
 
-        # Novel views
-        self.n_novel_views = 40
+        # ViewCrafter teachers
         self.min_teacher_views = 8
 
         # Loss weights
         self.lambda_teacher = 0.2
         self.lambda_lpips = 0.1
+        self.lambda_trajectory = 0.03
         self.lambda_anchor_reg = 0.01
-
-        # Teacher generation
-        self.use_sdxl = False
-        self.teacher_strength = 0.55
-        self.teacher_guidance_scale = 7.5
-        self.teacher_steps = 20
-        self.controlnet_scale = 0.8
-        self.depth_consistency_threshold = 0.25
-        self.teacher_seed = 42
-        self.teacher_prompt = "a high quality photograph of an outdoor scene, sharp details, no artifacts"
-        self.teacher_negative_prompt = "blurry, floaters, artifacts, low quality, distorted geometry"
 
         # Iterative refinement round
         self.round = 1
@@ -759,26 +706,18 @@ def add_distillation_args(parser: ArgumentParser):
     g.add_argument("--position_lr_final", type=float, default=1e-6)
     g.add_argument("--offset_lr_init", type=float, default=1e-3)
     g.add_argument("--offset_lr_final", type=float, default=5e-5)
-    g.add_argument("--n_novel_views", type=int, default=40)
     g.add_argument("--min_teacher_views", type=int, default=8)
     g.add_argument("--lambda_teacher", type=float, default=0.2)
     g.add_argument("--lambda_lpips", type=float, default=0.1)
+    g.add_argument(
+        "--lambda_trajectory",
+        "--lambda_temporal",
+        dest="lambda_trajectory",
+        type=float,
+        default=0.03,
+        help="Cross-view trajectory-delta loss weight.",
+    )
     g.add_argument("--lambda_anchor_reg", type=float, default=0.01)
-    g.add_argument("--use_sdxl", action="store_true", default=False)
-    g.add_argument("--teacher_strength", type=float, default=0.55)
-    g.add_argument("--teacher_guidance_scale", type=float, default=7.5)
-    g.add_argument("--teacher_steps", type=int, default=20)
-    g.add_argument("--controlnet_scale", type=float, default=0.8)
-    g.add_argument("--depth_consistency_threshold", type=float, default=0.25)
-    g.add_argument("--teacher_seed", type=int, default=42)
-    g.add_argument(
-        "--teacher_prompt",
-        default="a high quality photograph of an outdoor scene, sharp details, no artifacts",
-    )
-    g.add_argument(
-        "--teacher_negative_prompt",
-        default="blurry, floaters, artifacts, low quality, distorted geometry",
-    )
     g.add_argument("--round", type=int, default=1)
     return parser
 
