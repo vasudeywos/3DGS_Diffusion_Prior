@@ -56,6 +56,7 @@ import torchvision.transforms.functional as tf
 import lpips
 from random import randint
 from utils.loss_utils import l1_loss, ssim
+from utils.async_image_writer import AsyncImageWriter
 from gaussian_renderer import prefilter_voxel, render, network_gui
 from scene import Scene, GaussianModel
 from utils.general_utils import safe_state
@@ -296,7 +297,16 @@ def training_report(tb_writer, dataset_name, iteration, Ll1, loss, l1_loss, elap
 
         scene.gaussians.train()
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
+def render_set(
+    model_path,
+    name,
+    iteration,
+    views,
+    gaussians,
+    pipeline,
+    background,
+    image_write_workers=4,
+):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     error_path = os.path.join(model_path, name, "ours_{}".format(iteration), "errors")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
@@ -308,6 +318,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     visible_count_list = []
     name_list = []
     per_view_dict = {}
+    writer = AsyncImageWriter(workers=image_write_workers)
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
         
         torch.cuda.synchronize();t_start = time.time()
@@ -321,7 +332,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         # renders
         rendering = torch.clamp(render_pkg["render"], 0.0, 1.0)
         visible_count = (render_pkg["radii"] > 0).sum()
-        visible_count_list.append(visible_count)
+        visible_count_list.append(visible_count.item())
 
 
         # gts
@@ -334,17 +345,19 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
 
 
         name_list.append('{0:05d}'.format(idx) + ".png")
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(errormap, os.path.join(error_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        filename = '{0:05d}'.format(idx) + ".png"
+        writer.submit(rendering, os.path.join(render_path, filename))
+        writer.submit(errormap, os.path.join(error_path, filename))
+        writer.submit(gt, os.path.join(gts_path, filename))
         per_view_dict['{0:05d}'.format(idx) + ".png"] = visible_count.item()
+    writer.close()
     
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)
     
     return t_list, visible_count_list
 
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train=True, skip_test=False, wandb=None, tb_writer=None, dataset_name=None, logger=None, image_write_workers=4):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
@@ -357,14 +370,14 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             os.makedirs(dataset.model_path)
 
         if not skip_train:
-            t_train_list, visible_count  = render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+            t_train_list, visible_count  = render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, image_write_workers)
             train_fps = 1.0 / torch.tensor(t_train_list[5:]).mean()
             logger.info(f'Train FPS: \033[1;35m{train_fps.item():.5f}\033[0m')
             if wandb is not None:
                 wandb.log({"train_fps":train_fps.item(), })
 
         if not skip_test:
-            t_test_list, visible_count = render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+            t_test_list, visible_count = render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, image_write_workers)
             test_fps = 1.0 / torch.tensor(t_test_list[5:]).mean()
             logger.info(f'Test FPS: \033[1;35m{test_fps.item():.5f}\033[0m')
             if tb_writer:
@@ -375,17 +388,12 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
     return visible_count
 
 
-def readImages(renders_dir, gt_dir):
-    renders = []
-    gts = []
-    image_names = []
-    for fname in os.listdir(renders_dir):
-        render = Image.open(renders_dir / fname)
-        gt = Image.open(gt_dir / fname)
-        renders.append(tf.to_tensor(render).unsqueeze(0)[:, :3, :, :].cuda())
-        gts.append(tf.to_tensor(gt).unsqueeze(0)[:, :3, :, :].cuda())
-        image_names.append(fname)
-    return renders, gts, image_names
+def read_image_pair(render_path, gt_path):
+    with Image.open(render_path) as image:
+        render_tensor = tf.to_tensor(image.convert("RGB")).unsqueeze(0).cuda()
+    with Image.open(gt_path) as image:
+        gt_tensor = tf.to_tensor(image.convert("RGB")).unsqueeze(0).cuda()
+    return render_tensor[:, :3], gt_tensor[:, :3]
 
 
 def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, dataset_name=None, logger=None):
@@ -414,21 +422,28 @@ def evaluate(model_paths, visible_count=None, wandb=None, tb_writer=None, datase
         method_dir = test_dir / method
         gt_dir = method_dir/ "gt"
         renders_dir = method_dir / "renders"
-        renders, gts, image_names = readImages(renders_dir, gt_dir)
+        image_names = sorted(
+            fname for fname in os.listdir(renders_dir)
+            if fname.lower().endswith(".png")
+        )
 
         ssims = []
         psnrs = []
         lpipss = []
 
-        for idx in tqdm(range(len(renders)), desc="Metric evaluation progress"):
-            ssims.append(ssim(renders[idx], gts[idx]))
-            psnrs.append(psnr(renders[idx], gts[idx]))
-            lpipss.append(lpips_fn(renders[idx], gts[idx]).detach())
+        for image_name in tqdm(image_names, desc="Metric evaluation progress"):
+            rendered, gt = read_image_pair(
+                renders_dir / image_name,
+                gt_dir / image_name,
+            )
+            ssims.append(ssim(rendered, gt).item())
+            psnrs.append(psnr(rendered, gt).mean().item())
+            lpipss.append(lpips_fn(rendered, gt).mean().item())
         
         if wandb is not None:
-            wandb.log({"test_SSIMS":torch.stack(ssims).mean().item(), })
-            wandb.log({"test_PSNR_final":torch.stack(psnrs).mean().item(), })
-            wandb.log({"test_LPIPS":torch.stack(lpipss).mean().item(), })
+            wandb.log({"test_SSIMS":torch.tensor(ssims).mean().item(), })
+            wandb.log({"test_PSNR_final":torch.tensor(psnrs).mean().item(), })
+            wandb.log({"test_LPIPS":torch.tensor(lpipss).mean().item(), })
 
         logger.info(f"model_paths: \033[1;35m{model_paths}\033[0m")
         logger.info("  SSIM : \033[1;35m{:>12.7f}\033[0m".format(torch.tensor(ssims).mean(), ".5"))
@@ -495,6 +510,12 @@ if __name__ == "__main__":
     parser.add_argument("--checkpoint_iterations", nargs="+", type=int, default=[])
     parser.add_argument("--start_checkpoint", type=str, default = None)
     parser.add_argument("--gpu", type=str, default = '-1')
+    parser.add_argument(
+        "--image_write_workers",
+        type=int,
+        default=4,
+        help="CPU workers for bounded asynchronous PNG encoding; use 0 for synchronous writes.",
+    )
     args = parser.parse_args(sys.argv[1:])
     args.save_iterations.append(args.iterations)
 
@@ -561,7 +582,14 @@ if __name__ == "__main__":
 
     # rendering
     logger.info(f'\nStarting Rendering~')
-    visible_count = render_sets(lp.extract(args), -1, pp.extract(args), wandb=wandb, logger=logger)
+    visible_count = render_sets(
+        lp.extract(args),
+        -1,
+        pp.extract(args),
+        wandb=wandb,
+        logger=logger,
+        image_write_workers=args.image_write_workers,
+    )
     logger.info("\nRendering complete.")
 
     # calc metrics

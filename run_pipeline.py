@@ -68,6 +68,7 @@ def main():
     parser.add_argument("--test_views_file", type=str, default=None)
     parser.add_argument("--gpu", type=str, default="0")
     parser.add_argument("--resolution", type=int, default=4)
+    parser.add_argument("--image_write_workers", type=int, default=4)
     parser.add_argument("--stage1_iterations", type=int, default=30000)
     parser.add_argument("--skip_stage1", action="store_true")
     parser.add_argument("--round", type=int, default=1)
@@ -245,6 +246,7 @@ def main():
             "--data_device", "cpu",
             "--ratio", "1",
             "--gpu", args.gpu,
+            "--image_write_workers", str(args.image_write_workers),
             "--save_iterations", str(args.stage1_iterations),
             "--test_iterations", str(args.stage1_iterations),
             "--eval",

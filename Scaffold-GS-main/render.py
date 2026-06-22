@@ -14,9 +14,16 @@ import torch
 import numpy as np
 
 import subprocess
-cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
-result = subprocess.run(cmd, shell=True, stdout=subprocess.PIPE).stdout.decode().split('\n')
-os.environ['CUDA_VISIBLE_DEVICES']=str(np.argmin([int(x.split()[2]) for x in result[:-1]]))
+if not os.environ.get("CUDA_VISIBLE_DEVICES"):
+    cmd = 'nvidia-smi -q -d Memory |grep -A4 GPU|grep Used'
+    result = subprocess.run(
+        cmd, shell=True, stdout=subprocess.PIPE
+    ).stdout.decode().splitlines()
+    used_memory = [
+        int(line.split()[2]) for line in result if len(line.split()) >= 3
+    ]
+    if used_memory:
+        os.environ['CUDA_VISIBLE_DEVICES'] = str(np.argmin(used_memory))
 
 os.system('echo $CUDA_VISIBLE_DEVICES')
 
@@ -27,11 +34,21 @@ from gaussian_renderer import render, prefilter_voxel
 import torchvision
 from tqdm import tqdm
 from utils.general_utils import safe_state
+from utils.async_image_writer import AsyncImageWriter
 from argparse import ArgumentParser
 from arguments import ModelParams, PipelineParams, get_combined_args
 from gaussian_renderer import GaussianModel
 
-def render_set(model_path, name, iteration, views, gaussians, pipeline, background):
+def render_set(
+    model_path,
+    name,
+    iteration,
+    views,
+    gaussians,
+    pipeline,
+    background,
+    image_write_workers=4,
+):
     render_path = os.path.join(model_path, name, "ours_{}".format(iteration), "renders")
     gts_path = os.path.join(model_path, name, "ours_{}".format(iteration), "gt")
     if not os.path.exists(render_path):
@@ -43,6 +60,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     per_view_dict = {}
     # debug = 0
     t_list = []
+    writer = AsyncImageWriter(workers=image_write_workers)
     for idx, view in enumerate(tqdm(views, desc="Rendering progress")):
 
         torch.cuda.synchronize(); t0 = time.time()
@@ -55,8 +73,10 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
         rendering = render_pkg["render"]
         gt = view.original_image[0:3, :, :]
         name_list.append('{0:05d}'.format(idx) + ".png")
-        torchvision.utils.save_image(rendering, os.path.join(render_path, '{0:05d}'.format(idx) + ".png"))
-        torchvision.utils.save_image(gt, os.path.join(gts_path, '{0:05d}'.format(idx) + ".png"))
+        filename = '{0:05d}'.format(idx) + ".png"
+        writer.submit(rendering, os.path.join(render_path, filename))
+        writer.submit(gt, os.path.join(gts_path, filename))
+    writer.close()
 
     t = np.array(t_list[5:])
     fps = 1.0 / t.mean()
@@ -65,7 +85,7 @@ def render_set(model_path, name, iteration, views, gaussians, pipeline, backgrou
     with open(os.path.join(model_path, name, "ours_{}".format(iteration), "per_view_count.json"), 'w') as fp:
             json.dump(per_view_dict, fp, indent=True)      
      
-def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool):
+def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParams, skip_train : bool, skip_test : bool, image_write_workers=4):
     with torch.no_grad():
         gaussians = GaussianModel(dataset.feat_dim, dataset.n_offsets, dataset.voxel_size, dataset.update_depth, dataset.update_init_factor, dataset.update_hierachy_factor, dataset.use_feat_bank, 
                               dataset.appearance_dim, dataset.ratio, dataset.add_opacity_dist, dataset.add_cov_dist, dataset.add_color_dist)
@@ -79,10 +99,10 @@ def render_sets(dataset : ModelParams, iteration : int, pipeline : PipelineParam
             os.makedirs(dataset.model_path)
         
         if not skip_train:
-             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background)
+             render_set(dataset.model_path, "train", scene.loaded_iter, scene.getTrainCameras(), gaussians, pipeline, background, image_write_workers)
 
         if not skip_test:
-             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background)
+             render_set(dataset.model_path, "test", scene.loaded_iter, scene.getTestCameras(), gaussians, pipeline, background, image_write_workers)
 
 if __name__ == "__main__":
     # Set up command line argument parser
@@ -93,10 +113,23 @@ if __name__ == "__main__":
     parser.add_argument("--skip_train", action="store_true")
     parser.add_argument("--skip_test", action="store_true")
     parser.add_argument("--quiet", action="store_true")
+    parser.add_argument(
+        "--image_write_workers",
+        type=int,
+        default=4,
+        help="CPU workers for bounded asynchronous PNG encoding; use 0 for synchronous writes.",
+    )
     args = get_combined_args(parser)
     print("Rendering " + args.model_path)
 
     # Initialize system state (RNG)
     safe_state(args.quiet)
 
-    render_sets(model.extract(args), args.iteration, pipeline.extract(args), args.skip_train, args.skip_test)
+    render_sets(
+        model.extract(args),
+        args.iteration,
+        pipeline.extract(args),
+        args.skip_train,
+        args.skip_test,
+        args.image_write_workers,
+    )
