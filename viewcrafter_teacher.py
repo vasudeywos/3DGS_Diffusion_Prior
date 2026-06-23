@@ -324,9 +324,15 @@ class ViewCrafterTeacherDataset:
             (items[index], items[index + 1])
             for items in self.clips.values()
             for index in range(len(items) - 1)
+            if (
+                items[index + 1][2]["frame_index"]
+                == items[index][2]["frame_index"] + 1
+            )
         ]
         if not self.adjacent_pairs:
-            raise RuntimeError("ViewCrafter cache contains no adjacent teacher pairs.")
+            raise RuntimeError(
+                "ViewCrafter cache contains no consecutive teacher-frame pairs."
+            )
 
     def __len__(self):
         return len(self.pairs)

@@ -40,6 +40,7 @@ if "--gpu" in sys.argv and not os.environ.get("CUDA_VISIBLE_DEVICES"):
         os.environ["CUDA_VISIBLE_DEVICES"] = sys.argv[_gpu_index + 1]
 
 import torch
+import torch.nn.functional as F
 import json
 from pathlib import Path
 from tqdm import tqdm
@@ -120,6 +121,7 @@ def teacher_distillation_loss(
     teacher: torch.Tensor,
     lambda_l1: float = 1.0,
     lambda_lpips: float = 0.1,
+    supervision_scale: float = 1.0,
 ) -> torch.Tensor:
     """
     L_teacher = L1(render, teacher) + λ_lpips * LPIPS(render, teacher)
@@ -132,6 +134,22 @@ def teacher_distillation_loss(
     Returns:
         Scalar distillation loss.
     """
+    if not (0.0 < supervision_scale <= 1.0):
+        raise ValueError("Teacher supervision scale must be in (0, 1].")
+    if supervision_scale < 1.0:
+        height = max(32, round(rendered.shape[-2] * supervision_scale))
+        width = max(32, round(rendered.shape[-1] * supervision_scale))
+        rendered = F.interpolate(
+            rendered.unsqueeze(0),
+            size=(height, width),
+            mode="area",
+        ).squeeze(0)
+        teacher = F.interpolate(
+            teacher.unsqueeze(0),
+            size=(height, width),
+            mode="area",
+        ).squeeze(0)
+
     l1 = l1_loss(rendered, teacher)
 
     # LPIPS expects (B, 3, H, W) in [-1, 1]
@@ -400,7 +418,10 @@ def train_distill(
                 f"Only {len(teacher_dataset)} teacher views passed filtering; "
                 f"at least {minimum_teachers} are required."
             )
-        logger.info(f"Teacher dataset: {len(teacher_dataset)} pairs.")
+        logger.info(
+            f"Teacher dataset: {len(teacher_dataset)} views, "
+            f"{len(teacher_dataset.adjacent_pairs)} consecutive pairs."
+        )
     else:
         logger.info("Real-only control: teacher rendering/losses disabled.")
 
@@ -414,7 +435,8 @@ def train_distill(
 
     iterations = distill_args.distill_iterations
     log_interval = 100
-    save_interval = iterations  # save at end by default
+    save_iterations = set(distill_args.save_iterations)
+    save_iterations.add(iterations)
 
     ema_loss = 0.0
     progress_bar = tqdm(range(1, iterations + 1), desc="Distillation")
@@ -490,12 +512,14 @@ def train_distill(
                     teacher_img_a,
                     lambda_l1=distill_args.lambda_teacher_l1,
                     lambda_lpips=distill_args.lambda_lpips,
+                    supervision_scale=distill_args.teacher_supervision_scale,
                 )
                 + teacher_distillation_loss(
                     rendered_teacher_b,
                     teacher_img_b,
                     lambda_l1=distill_args.lambda_teacher_l1,
                     lambda_lpips=distill_args.lambda_lpips,
+                    supervision_scale=distill_args.teacher_supervision_scale,
                 )
             )
             L_trajectory = trajectory_delta_loss(
@@ -595,7 +619,7 @@ def train_distill(
         # ------------------------------------------------------------------
         # 4h. Save checkpoint
         # ------------------------------------------------------------------
-        if iteration == iterations or iteration % save_interval == 0:
+        if iteration in save_iterations:
             os.makedirs(distill_args.distill_output, exist_ok=True)
 
             # Also save the point cloud + MLPs in ScaffoldGS's standard layout.
@@ -707,6 +731,8 @@ class DistillationParams:
         self.lambda_lpips = 0.1
         self.lambda_trajectory = 0.03
         self.lambda_anchor_reg = 0.01
+        self.teacher_supervision_scale = 1.0
+        self.save_iterations = []
 
         # Iterative refinement round
         self.round = 1
@@ -738,6 +764,15 @@ def add_distillation_args(parser: ArgumentParser):
     g.add_argument("--lambda_teacher_l1", type=float, default=1.0)
     g.add_argument("--lambda_lpips", type=float, default=0.1)
     g.add_argument(
+        "--teacher_supervision_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Downsample render and teacher before teacher L1/LPIPS. "
+            "Values below 1 emphasize low-frequency diffusion guidance."
+        ),
+    )
+    g.add_argument(
         "--lambda_trajectory",
         "--lambda_temporal",
         dest="lambda_trajectory",
@@ -746,6 +781,14 @@ def add_distillation_args(parser: ArgumentParser):
         help="Cross-view trajectory-delta loss weight.",
     )
     g.add_argument("--lambda_anchor_reg", type=float, default=0.01)
+    g.add_argument(
+        "--distill_save_iterations",
+        dest="save_iterations",
+        nargs="+",
+        type=int,
+        default=[],
+        help="Stage-2 iterations at which to save Scaffold-GS states.",
+    )
     g.add_argument("--round", type=int, default=1)
     return parser
 
