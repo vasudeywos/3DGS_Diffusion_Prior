@@ -713,6 +713,14 @@ class DistillationParams:
 
 
 def add_distillation_args(parser: ArgumentParser):
+    # OptimizationParams already registers these four CLI options. Override
+    # their defaults for distillation instead of registering them twice.
+    parser.set_defaults(
+        position_lr_init=1e-4,
+        position_lr_final=1e-6,
+        offset_lr_init=1e-3,
+        offset_lr_final=5e-5,
+    )
     g = parser.add_argument_group("Distillation Parameters")
     g.add_argument("--distill_output", type=str, default="./output/distill")
     g.add_argument("--teacher_cache_dir", type=str, default="./teacher_cache")
@@ -725,10 +733,6 @@ def add_distillation_args(parser: ArgumentParser):
         choices=["all", "shared_mlp", "shared_mlp_features", "shared_mlp_geometry"],
         default="all",
     )
-    g.add_argument("--position_lr_init", type=float, default=1e-4)
-    g.add_argument("--position_lr_final", type=float, default=1e-6)
-    g.add_argument("--offset_lr_init", type=float, default=1e-3)
-    g.add_argument("--offset_lr_final", type=float, default=5e-5)
     g.add_argument("--min_teacher_views", type=int, default=8)
     g.add_argument("--lambda_teacher", type=float, default=0.2)
     g.add_argument("--lambda_teacher_l1", type=float, default=1.0)
