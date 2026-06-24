@@ -101,8 +101,8 @@ guidance rather than pixel-accurate geometric truth. It:
 - keeps at most 12 high-quality frames selected as adjacent pairs;
 - runs a matched real-only `shared_mlp` continuation;
 - runs a weak-prior `shared_mlp` continuation from the same Stage-1 state;
-- uses `lambda_teacher=0.05`, teacher L1 weight `0.1`, LPIPS weight `1.0`,
-  and trajectory weight `0.01`;
+- uses `lambda_teacher=0.01`, teacher L1 weight `0.0`, LPIPS weight `1.0`,
+  teacher supervision scale `0.25`, and trajectory weight `0.0`;
 - leaves anchor regularisation at zero because anchors are frozen in
   `shared_mlp`.
 

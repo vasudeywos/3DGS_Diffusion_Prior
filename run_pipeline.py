@@ -112,6 +112,15 @@ def main():
     parser.add_argument("--lambda_teacher", type=float, default=0.2)
     parser.add_argument("--lambda_teacher_l1", type=float, default=1.0)
     parser.add_argument("--lambda_lpips", type=float, default=0.1)
+    parser.add_argument(
+        "--teacher_supervision_scale",
+        type=float,
+        default=1.0,
+        help=(
+            "Downsample teacher render/image before teacher L1/LPIPS. "
+            "Useful for low-frequency weak-prior supervision."
+        ),
+    )
     parser.add_argument("--lambda_trajectory", type=float, default=0.03)
     parser.add_argument("--lambda_anchor_reg", type=float, default=0.01)
     parser.add_argument(
@@ -154,8 +163,6 @@ def main():
         args.distill_iterations = 200
         args.compare_parameter_modes = True
     if args.weak_prior_exploratory:
-        args.stage1_iterations = 200
-        args.distill_iterations = 200
         args.viewcrafter_max_total_teachers = (
             args.viewcrafter_max_total_teachers or 12
         )
@@ -364,16 +371,18 @@ def main():
                 "lambda_teacher": 0.0,
                 "lambda_teacher_l1": 0.0,
                 "lambda_lpips": 0.0,
+                "teacher_supervision_scale": 1.0,
                 "lambda_trajectory": 0.0,
                 "lambda_anchor_reg": 0.0,
             },
             {
                 "name": "weak_prior_shared_mlp",
                 "parameter_mode": "shared_mlp",
-                "lambda_teacher": 0.05,
-                "lambda_teacher_l1": 0.1,
+                "lambda_teacher": 0.01,
+                "lambda_teacher_l1": 0.0,
                 "lambda_lpips": 1.0,
-                "lambda_trajectory": 0.01,
+                "teacher_supervision_scale": 0.25,
+                "lambda_trajectory": 0.0,
                 "lambda_anchor_reg": 0.0,
             },
         ]
@@ -390,6 +399,7 @@ def main():
                 "lambda_teacher": args.lambda_teacher,
                 "lambda_teacher_l1": args.lambda_teacher_l1,
                 "lambda_lpips": args.lambda_lpips,
+                "teacher_supervision_scale": args.teacher_supervision_scale,
                 "lambda_trajectory": args.lambda_trajectory,
                 "lambda_anchor_reg": args.lambda_anchor_reg,
             }
@@ -424,6 +434,8 @@ def main():
             "--lambda_teacher", str(experiment["lambda_teacher"]),
             "--lambda_teacher_l1", str(experiment["lambda_teacher_l1"]),
             "--lambda_lpips", str(experiment["lambda_lpips"]),
+            "--teacher_supervision_scale",
+            str(experiment["teacher_supervision_scale"]),
             "--lambda_trajectory", str(experiment["lambda_trajectory"]),
             "--lambda_anchor_reg", str(experiment["lambda_anchor_reg"]),
             "--parameter_mode", parameter_mode,
