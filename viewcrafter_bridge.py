@@ -167,7 +167,15 @@ def main():
         return
 
     os.chdir(root)
-    sys.path.insert(0, str(root))
+    for import_path in (
+        root,
+        root / "extern",
+        root / "extern" / "dust3r",
+        root / "extern" / "DUSt3R",
+        root / "dust3r",
+    ):
+        if import_path.exists():
+            sys.path.insert(0, str(import_path))
 
     import glob
     import numpy as np
