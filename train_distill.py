@@ -89,6 +89,9 @@ def anchor_regularisation_loss(
     gaussians: GaussianModel,
     anchor_init: torch.Tensor,
     offset_init: torch.Tensor,
+    scaling_init: torch.Tensor | None = None,
+    rotation_init: torch.Tensor | None = None,
+    opacity_init: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """
     Soft stiffness penalty on anchor positions and offsets.
@@ -109,7 +112,23 @@ def anchor_regularisation_loss(
     offset_diff = gaussians._offset[:n_orig] - offset_init[:n_orig]
     offset_reg = (offset_diff ** 2).mean()
 
-    return anchor_reg + 0.1 * offset_reg
+    regularization = anchor_reg + 0.1 * offset_reg
+    if scaling_init is not None:
+        n_scale = min(scaling_init.shape[0], gaussians._scaling.shape[0])
+        regularization = regularization + 0.1 * (
+            (gaussians._scaling[:n_scale] - scaling_init[:n_scale]) ** 2
+        ).mean()
+    if rotation_init is not None:
+        n_rot = min(rotation_init.shape[0], gaussians._rotation.shape[0])
+        regularization = regularization + 0.1 * (
+            (gaussians._rotation[:n_rot] - rotation_init[:n_rot]) ** 2
+        ).mean()
+    if opacity_init is not None:
+        n_opacity = min(opacity_init.shape[0], gaussians._opacity.shape[0])
+        regularization = regularization + 0.1 * (
+            (gaussians._opacity[:n_opacity] - opacity_init[:n_opacity]) ** 2
+        ).mean()
+    return regularization
 
 
 # ---------------------------------------------------------------------------
@@ -160,9 +179,109 @@ def teacher_distillation_loss(
     return lambda_l1 * l1 + lambda_lpips * perceptual
 
 
+def _teacher_quality(record, default=1.0):
+    quality = record.get("quality", default)
+    if isinstance(quality, dict):
+        quality = quality.get("quality_score", quality.get("confidence", default))
+    try:
+        return float(quality)
+    except (TypeError, ValueError):
+        return float(default)
+
+
+def _normalize_mask(mask, eps=1e-6):
+    mask = mask - mask.amin(dim=(-2, -1), keepdim=True)
+    denom = mask.amax(dim=(-2, -1), keepdim=True).clamp_min(eps)
+    return (mask / denom).clamp(0.0, 1.0)
+
+
+def selective_teacher_distillation_loss(
+    rendered: torch.Tensor,
+    teacher: torch.Tensor,
+    record: dict,
+    lambda_l1: float,
+    lambda_lpips: float,
+    supervision_scale: float,
+    mask_mode: str,
+    mask_gamma: float,
+    min_quality: float,
+    max_runtime_lpips: float,
+    runtime_tau: float,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Teacher loss with metadata confidence and artifact-region weighting."""
+    if not (0.0 < supervision_scale <= 1.0):
+        raise ValueError("Teacher supervision scale must be in (0, 1].")
+    if supervision_scale < 1.0:
+        height = max(32, round(rendered.shape[-2] * supervision_scale))
+        width = max(32, round(rendered.shape[-1] * supervision_scale))
+        rendered = F.interpolate(
+            rendered.unsqueeze(0),
+            size=(height, width),
+            mode="area",
+        ).squeeze(0)
+        teacher = F.interpolate(
+            teacher.unsqueeze(0),
+            size=(height, width),
+            mode="area",
+        ).squeeze(0)
+
+    with torch.no_grad():
+        metadata_quality = max(_teacher_quality(record, 1.0), 0.0)
+        if metadata_quality < min_quality:
+            return (
+                rendered.new_zeros(()),
+                rendered.new_tensor(metadata_quality),
+                rendered.new_zeros(()),
+            )
+        error_map = torch.mean(torch.abs(rendered.detach() - teacher), dim=0, keepdim=True)
+        if mask_mode == "error":
+            mask = _normalize_mask(error_map).pow(mask_gamma)
+        elif mask_mode == "none":
+            mask = torch.ones_like(error_map)
+        else:
+            raise ValueError(f"Unknown teacher_mask_mode: {mask_mode}")
+        # Keep a small floor so the teacher can still shape globally plausible color.
+        mask = (0.15 + 0.85 * mask).clamp(0.0, 1.0)
+
+    masked_l1 = (
+        torch.abs(rendered - teacher) * mask
+    ).sum() / (mask.sum() * rendered.shape[0]).clamp_min(1e-6)
+
+    rendered_lpips = rendered.unsqueeze(0) * 2.0 - 1.0
+    teacher_lpips = teacher.unsqueeze(0) * 2.0 - 1.0
+    perceptual = get_lpips_fn()(rendered_lpips, teacher_lpips).mean()
+    with torch.no_grad():
+        if max_runtime_lpips > 0 and perceptual.detach() > max_runtime_lpips:
+            runtime_weight = torch.exp(-perceptual.detach() / runtime_tau)
+        else:
+            runtime_weight = rendered.new_tensor(1.0)
+        weight = rendered.new_tensor(metadata_quality) * runtime_weight
+    loss = weight * (lambda_l1 * masked_l1 + lambda_lpips * perceptual)
+    return loss, weight.detach(), mask.mean().detach()
+
+
 def trajectory_delta_loss(render_a, render_b, teacher_a, teacher_b):
     """Match local cross-view change along the static-scene camera path."""
     return l1_loss(render_b - render_a, teacher_b - teacher_a)
+
+
+def teacher_weight_schedule(iteration, args):
+    if iteration < args.teacher_start_iteration:
+        return 0.0
+    if args.teacher_ramp_iterations > 0:
+        ramp = min(
+            1.0,
+            (iteration - args.teacher_start_iteration + 1)
+            / float(args.teacher_ramp_iterations),
+        )
+    else:
+        ramp = 1.0
+    if (
+        args.teacher_recovery_start > 0
+        and iteration >= args.teacher_recovery_start
+    ):
+        ramp *= args.teacher_recovery_scale
+    return ramp
 
 
 # ---------------------------------------------------------------------------
@@ -251,9 +370,21 @@ def configure_trainable_parameters(gaussians, mode: str, logger=None):
     allowed_by_mode = {
         "all": None,
         "shared_mlp": {"mlp_opacity", "mlp_cov", "mlp_color", "mlp_featurebank"},
+        "mlp_anchorfeat": {
+            "mlp_opacity", "mlp_cov", "mlp_color", "mlp_featurebank",
+            "anchor_feat",
+        },
         "shared_mlp_features": {
             "mlp_opacity", "mlp_cov", "mlp_color", "mlp_featurebank",
             "anchor_feat",
+        },
+        "geometry_light": {
+            "mlp_opacity", "mlp_cov", "mlp_color", "mlp_featurebank",
+            "anchor_feat", "offset", "opacity", "scaling", "rotation",
+        },
+        "densify_light": {
+            "mlp_opacity", "mlp_cov", "mlp_color", "mlp_featurebank",
+            "anchor", "anchor_feat", "offset", "opacity", "scaling", "rotation",
         },
         "shared_mlp_geometry": {
             "mlp_opacity", "mlp_cov", "mlp_color", "mlp_featurebank",
@@ -372,17 +503,20 @@ def train_distill(
     )
 
     if distill_args.lambda_anchor_reg > 0 and distill_args.parameter_mode not in {
-        "all", "shared_mlp_geometry"
+        "all", "shared_mlp_geometry", "geometry_light", "densify_light"
     }:
         logger.warning(
             "lambda_anchor_reg is non-zero, but the selected parameter mode freezes "
             "anchors and offsets; the regularizer will have no effect."
         )
-    if distill_args.lambda_anchor_reg > 0 and distill_args.distill_densify_until > 0:
+    if distill_args.lambda_anchor_reg > 0 and (
+        distill_args.distill_densify_until > 0
+        or distill_args.teacher_densify_until > 0
+    ):
         raise ValueError(
             "Anchor regularisation requires stable anchor identities. Set "
-            "--distill_densify_until 0, or set --lambda_anchor_reg 0 for a "
-            "separate densification experiment."
+            "--distill_densify_until/--teacher_densify_until 0, or set "
+            "--lambda_anchor_reg 0 for a separate densification experiment."
         )
 
     # -----------------------------------------------------------------------
@@ -390,6 +524,9 @@ def train_distill(
     # -----------------------------------------------------------------------
     anchor_init = gaussians._anchor.detach().clone()
     offset_init = gaussians._offset.detach().clone()
+    scaling_init = gaussians._scaling.detach().clone()
+    rotation_init = gaussians._rotation.detach().clone()
+    opacity_init = gaussians._opacity.detach().clone()
     logger.info(f"Snapshotted {anchor_init.shape[0]} anchors for regularisation.")
 
     # -----------------------------------------------------------------------
@@ -448,6 +585,9 @@ def train_distill(
         "trajectory": 0.0,
         "anchor_reg": 0.0,
         "total": 0.0,
+        "teacher_weight": 0.0,
+        "teacher_mask": 0.0,
+        "teacher_schedule": 0.0,
     }
     count = 0
 
@@ -487,10 +627,18 @@ def train_distill(
         # 4b. Teacher distillation loss (novel views)
         # ------------------------------------------------------------------
         if uses_teacher_prior:
-            (teacher_cam_a, teacher_img_a), (teacher_cam_b, teacher_img_b) = (
-                teacher_dataset.sample_adjacent()
+            teacher_render_packages = []
+            (
+                (teacher_cam_a, teacher_img_a, teacher_record_a),
+                (teacher_cam_b, teacher_img_b, teacher_record_b),
+            ) = (
+                teacher_dataset.sample_adjacent_with_records()
             )
             rendered_teachers = []
+            teacher_densify_active = (
+                distill_args.teacher_densify_until > 0
+                and distill_args.teacher_densify_from <= iteration < distill_args.teacher_densify_until
+            )
             for teacher_cam in (teacher_cam_a, teacher_cam_b):
                 visible_mask = prefilter_voxel(
                     teacher_cam, gaussians, pipe_args, background
@@ -501,27 +649,41 @@ def train_distill(
                     pipe_args,
                     background,
                     visible_mask=visible_mask,
-                    retain_grad=False,
+                    retain_grad=teacher_densify_active,
                 )
                 rendered_teachers.append(render_pkg["render"])
+                teacher_render_packages.append((render_pkg, visible_mask))
             rendered_teacher_a, rendered_teacher_b = rendered_teachers
 
-            L_teacher = 0.5 * (
-                teacher_distillation_loss(
-                    rendered_teacher_a,
-                    teacher_img_a,
-                    lambda_l1=distill_args.lambda_teacher_l1,
-                    lambda_lpips=distill_args.lambda_lpips,
-                    supervision_scale=distill_args.teacher_supervision_scale,
-                )
-                + teacher_distillation_loss(
-                    rendered_teacher_b,
-                    teacher_img_b,
-                    lambda_l1=distill_args.lambda_teacher_l1,
-                    lambda_lpips=distill_args.lambda_lpips,
-                    supervision_scale=distill_args.teacher_supervision_scale,
-                )
+            loss_a, weight_a, mask_a = selective_teacher_distillation_loss(
+                rendered_teacher_a,
+                teacher_img_a,
+                teacher_record_a,
+                lambda_l1=distill_args.lambda_teacher_l1,
+                lambda_lpips=distill_args.lambda_lpips,
+                supervision_scale=distill_args.teacher_supervision_scale,
+                mask_mode=distill_args.teacher_mask_mode,
+                mask_gamma=distill_args.teacher_mask_gamma,
+                min_quality=distill_args.min_teacher_quality,
+                max_runtime_lpips=distill_args.max_runtime_teacher_lpips,
+                runtime_tau=distill_args.runtime_teacher_tau,
             )
+            loss_b, weight_b, mask_b = selective_teacher_distillation_loss(
+                rendered_teacher_b,
+                teacher_img_b,
+                teacher_record_b,
+                lambda_l1=distill_args.lambda_teacher_l1,
+                lambda_lpips=distill_args.lambda_lpips,
+                supervision_scale=distill_args.teacher_supervision_scale,
+                mask_mode=distill_args.teacher_mask_mode,
+                mask_gamma=distill_args.teacher_mask_gamma,
+                min_quality=distill_args.min_teacher_quality,
+                max_runtime_lpips=distill_args.max_runtime_teacher_lpips,
+                runtime_tau=distill_args.runtime_teacher_tau,
+            )
+            L_teacher = 0.5 * (loss_a + loss_b)
+            teacher_weight_stat = 0.5 * (weight_a + weight_b)
+            teacher_mask_stat = 0.5 * (mask_a + mask_b)
             L_trajectory = trajectory_delta_loss(
                 rendered_teacher_a,
                 rendered_teacher_b,
@@ -531,18 +693,29 @@ def train_distill(
         else:
             L_teacher = rendered_real.new_zeros(())
             L_trajectory = rendered_real.new_zeros(())
+            teacher_weight_stat = rendered_real.new_zeros(())
+            teacher_mask_stat = rendered_real.new_zeros(())
+            teacher_render_packages = []
 
         # ------------------------------------------------------------------
         # 4c. Anchor regularisation loss (soft geometry stiffness)
         # ------------------------------------------------------------------
-        L_anchor_reg = anchor_regularisation_loss(gaussians, anchor_init, offset_init)
+        L_anchor_reg = anchor_regularisation_loss(
+            gaussians,
+            anchor_init,
+            offset_init,
+            scaling_init=scaling_init,
+            rotation_init=rotation_init,
+            opacity_init=opacity_init,
+        )
 
         # ------------------------------------------------------------------
         # 4d. Total loss
         # ------------------------------------------------------------------
+        teacher_schedule = teacher_weight_schedule(iteration, distill_args)
         L_total = (
             L_real
-            + distill_args.lambda_teacher * L_teacher
+            + teacher_schedule * distill_args.lambda_teacher * L_teacher
             + distill_args.lambda_trajectory * L_trajectory
             + distill_args.lambda_anchor_reg * L_anchor_reg
         )
@@ -553,6 +726,55 @@ def train_distill(
         # 4e. Densification (only in early distillation iterations)
         # ------------------------------------------------------------------
         with torch.no_grad():
+            teacher_densify_active = (
+                distill_args.teacher_densify_until > 0
+                and distill_args.teacher_densify_from <= iteration < distill_args.teacher_densify_until
+            )
+            if (
+                teacher_densify_active
+                and teacher_weight_stat.item() >= distill_args.teacher_densify_min_weight
+            ):
+                for render_pkg_teacher, voxel_mask_teacher in teacher_render_packages:
+                    viewspace_pts = render_pkg_teacher.get("viewspace_points")
+                    visibility = render_pkg_teacher.get("visibility_filter")
+                    offset_mask = render_pkg_teacher.get("selection_mask")
+                    opacity = render_pkg_teacher.get("neural_opacity")
+                    if viewspace_pts is not None and viewspace_pts.grad is not None:
+                        gaussians.training_statis(
+                            viewspace_pts,
+                            opacity,
+                            visibility,
+                            offset_mask,
+                            voxel_mask_teacher,
+                        )
+                if (
+                    iteration > distill_args.teacher_densify_from
+                    and iteration % distill_args.teacher_densify_interval == 0
+                ):
+                    old_anchor_count = gaussians._anchor.shape[0]
+                    gaussians.adjust_anchor(
+                        check_interval=distill_args.teacher_densify_interval,
+                        success_threshold=distill_args.teacher_densify_success_threshold,
+                        grad_threshold=distill_args.teacher_densify_grad_threshold,
+                        min_opacity=distill_args.teacher_densify_min_opacity,
+                    )
+                    if gaussians._anchor.shape[0] > anchor_init.shape[0]:
+                        new_anchor_pad = gaussians._anchor[anchor_init.shape[0]:].detach().clone()
+                        new_offset_pad = gaussians._offset[anchor_init.shape[0]:].detach().clone()
+                        new_scaling_pad = gaussians._scaling[scaling_init.shape[0]:].detach().clone()
+                        new_rotation_pad = gaussians._rotation[rotation_init.shape[0]:].detach().clone()
+                        new_opacity_pad = gaussians._opacity[opacity_init.shape[0]:].detach().clone()
+                        anchor_init = torch.cat([anchor_init, new_anchor_pad], dim=0)
+                        offset_init = torch.cat([offset_init, new_offset_pad], dim=0)
+                        scaling_init = torch.cat([scaling_init, new_scaling_pad], dim=0)
+                        rotation_init = torch.cat([rotation_init, new_rotation_pad], dim=0)
+                        opacity_init = torch.cat([opacity_init, new_opacity_pad], dim=0)
+                    if logger and gaussians._anchor.shape[0] != old_anchor_count:
+                        logger.info(
+                            f"[ITER {iteration}] Teacher-guided densification: "
+                            f"{old_anchor_count} -> {gaussians._anchor.shape[0]} anchors."
+                        )
+
             if (iteration < distill_args.distill_densify_until
                     and iteration > opt_args.start_stat):
                 viewspace_pts = render_pkg_real.get("viewspace_points")
@@ -595,6 +817,9 @@ def train_distill(
         loss_accum["trajectory"] += L_trajectory.item()
         loss_accum["anchor_reg"] += L_anchor_reg.item()
         loss_accum["total"] += L_total.item()
+        loss_accum["teacher_weight"] += teacher_weight_stat.item()
+        loss_accum["teacher_mask"] += teacher_mask_stat.item()
+        loss_accum["teacher_schedule"] += float(teacher_schedule)
         count += 1
 
         if iteration % log_interval == 0:
@@ -605,6 +830,9 @@ def train_distill(
                 "teacher": f"{avg['teacher']:.5f}",
                 "path": f"{avg['trajectory']:.5f}",
                 "reg": f"{avg['anchor_reg']:.6f}",
+                "tw": f"{avg['teacher_weight']:.3f}",
+                "tm": f"{avg['teacher_mask']:.3f}",
+                "ts": f"{avg['teacher_schedule']:.2f}",
                 "anchors": gaussians._anchor.shape[0],
             })
             if tb_writer:
@@ -732,6 +960,22 @@ class DistillationParams:
         self.lambda_trajectory = 0.03
         self.lambda_anchor_reg = 0.01
         self.teacher_supervision_scale = 1.0
+        self.teacher_mask_mode = "error"
+        self.teacher_mask_gamma = 1.0
+        self.min_teacher_quality = 0.0
+        self.max_runtime_teacher_lpips = 0.75
+        self.runtime_teacher_tau = 0.5
+        self.teacher_start_iteration = 0
+        self.teacher_ramp_iterations = 0
+        self.teacher_recovery_start = 0
+        self.teacher_recovery_scale = 0.5
+        self.teacher_densify_from = 0
+        self.teacher_densify_until = 0
+        self.teacher_densify_interval = 100
+        self.teacher_densify_grad_threshold = 0.0002
+        self.teacher_densify_success_threshold = 0.8
+        self.teacher_densify_min_opacity = 0.005
+        self.teacher_densify_min_weight = 0.5
         self.save_iterations = []
 
         # Iterative refinement round
@@ -756,7 +1000,15 @@ def add_distillation_args(parser: ArgumentParser):
     g.add_argument("--distill_densify_until", type=int, default=0)
     g.add_argument(
         "--parameter_mode",
-        choices=["all", "shared_mlp", "shared_mlp_features", "shared_mlp_geometry"],
+        choices=[
+            "all",
+            "shared_mlp",
+            "shared_mlp_features",
+            "shared_mlp_geometry",
+            "mlp_anchorfeat",
+            "geometry_light",
+            "densify_light",
+        ],
         default="all",
     )
     g.add_argument("--min_teacher_views", type=int, default=8)
@@ -772,6 +1024,32 @@ def add_distillation_args(parser: ArgumentParser):
             "Values below 1 emphasize low-frequency diffusion guidance."
         ),
     )
+    g.add_argument(
+        "--teacher_mask_mode",
+        choices=["error", "none"],
+        default="error",
+        help="Mask teacher loss toward under-constrained render/teacher disagreement.",
+    )
+    g.add_argument("--teacher_mask_gamma", type=float, default=1.0)
+    g.add_argument("--min_teacher_quality", type=float, default=0.0)
+    g.add_argument(
+        "--max_runtime_teacher_lpips",
+        type=float,
+        default=0.75,
+        help="Soft-downweight teacher views whose current LPIPS exceeds this value.",
+    )
+    g.add_argument("--runtime_teacher_tau", type=float, default=0.5)
+    g.add_argument("--teacher_start_iteration", type=int, default=0)
+    g.add_argument("--teacher_ramp_iterations", type=int, default=0)
+    g.add_argument("--teacher_recovery_start", type=int, default=0)
+    g.add_argument("--teacher_recovery_scale", type=float, default=0.5)
+    g.add_argument("--teacher_densify_from", type=int, default=0)
+    g.add_argument("--teacher_densify_until", type=int, default=0)
+    g.add_argument("--teacher_densify_interval", type=int, default=100)
+    g.add_argument("--teacher_densify_grad_threshold", type=float, default=0.0002)
+    g.add_argument("--teacher_densify_success_threshold", type=float, default=0.8)
+    g.add_argument("--teacher_densify_min_opacity", type=float, default=0.005)
+    g.add_argument("--teacher_densify_min_weight", type=float, default=0.5)
     g.add_argument(
         "--lambda_trajectory",
         "--lambda_temporal",

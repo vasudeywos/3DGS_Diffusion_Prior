@@ -341,6 +341,10 @@ class ViewCrafterTeacherDataset:
         camera, path, _ = self.pairs[index]
         return camera, load_teacher_exact(path, camera, self.device)
 
+    def get_with_record(self, index):
+        camera, path, record = self.pairs[index]
+        return camera, load_teacher_exact(path, camera, self.device), record
+
     def sample(self):
         index = torch.randint(0, len(self.pairs), (1,)).item()
         return self[index]
@@ -349,7 +353,19 @@ class ViewCrafterTeacherDataset:
         camera, path, _ = item
         return camera, load_teacher_exact(path, camera, self.device)
 
+    def _load_item_with_record(self, item):
+        camera, path, record = item
+        return camera, load_teacher_exact(path, camera, self.device), record
+
     def sample_adjacent(self):
         index = torch.randint(0, len(self.adjacent_pairs), (1,)).item()
         first, second = self.adjacent_pairs[index]
         return self._load_item(first), self._load_item(second)
+
+    def sample_adjacent_with_records(self):
+        index = torch.randint(0, len(self.adjacent_pairs), (1,)).item()
+        first, second = self.adjacent_pairs[index]
+        return (
+            self._load_item_with_record(first),
+            self._load_item_with_record(second),
+        )

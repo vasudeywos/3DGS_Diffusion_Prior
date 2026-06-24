@@ -19,6 +19,7 @@ from arguments import ModelParams
 from scene import GaussianModel, Scene
 from viewcrafter_teacher import (
     SCHEMA_VERSION,
+    _camera_c2w,
     camera_pair_metrics,
     camera_to_record,
     compute_job_signature,
@@ -56,6 +57,38 @@ def merge_stage_config(args):
     return args
 
 
+def camera_center(camera):
+    return camera.camera_center.detach().cpu().numpy().astype(np.float32)
+
+
+def nearest_third_index(cameras, exclude, position):
+    candidates = [
+        (float(np.linalg.norm(camera_center(camera) - position)), index)
+        for index, camera in enumerate(cameras)
+        if index not in set(exclude)
+    ]
+    return min(candidates, key=lambda item: item[0])[1]
+
+
+def local_perturb_record(camera, delta, uid, name, clip_index, frame_index):
+    c2w = _camera_c2w(camera)
+    rotation = c2w[:3, :3].astype(np.float32)
+    position = (c2w[:3, 3] + delta).astype(np.float32)
+    translation = (-rotation.T @ position).astype(np.float32)
+    return {
+        "uid": int(uid),
+        "image_name": name,
+        "R": rotation.tolist(),
+        "T": translation.tolist(),
+        "FoVx": float(camera.FoVx),
+        "FoVy": float(camera.FoVy),
+        "height": int(camera.image_height),
+        "width": int(camera.image_width),
+        "clip_index": int(clip_index),
+        "frame_index": int(frame_index),
+    }
+
+
 def main():
     parser = ArgumentParser(description=__doc__)
     model = ModelParams(parser)
@@ -63,7 +96,14 @@ def main():
     parser.add_argument("--output_dir", required=True)
     parser.add_argument("--teacher_resolution", type=int, default=256)
     parser.add_argument("--targets_per_pair", type=int, default=6)
-    parser.add_argument("--max_total_teachers", type=int, default=12)
+    parser.add_argument("--max_total_teachers", type=int, default=44)
+    parser.add_argument("--local_perturbations_per_view", type=int, default=4)
+    parser.add_argument("--local_perturbation_fraction", type=float, default=0.035)
+    parser.add_argument(
+        "--allow_rejected_pairs",
+        action="store_true",
+        help="Keep adjacent sparse-view pairs even if the conservative filter rejects them.",
+    )
     parser.add_argument("--max_pair_angle", type=float, default=110.0)
     parser.add_argument("--min_view_cosine", type=float, default=0.2)
     parser.add_argument("--max_normalized_baseline", type=float, default=1.5)
@@ -135,7 +175,7 @@ def main():
             and metrics["relative_radial_difference"]
             <= args.max_radial_difference
         )
-        if not compatible:
+        if not compatible and not args.allow_rejected_pairs:
             rejected_pairs.append({
                 "source_segment_index": source_segment_index,
                 "start_image": start.image_name,
@@ -146,10 +186,23 @@ def main():
 
         clip_index = len(clips)
         teachers = []
+        start_index = source_segment_index
+        end_index = source_segment_index + 1
         for local_index, t in enumerate(per_pair_t):
             name = f"es_clip{clip_index:02d}_frame{local_index:02d}"
             camera = interpolate_camera(start, end, float(t), uid, name)
-            teachers.append(camera_to_record(camera, clip_index, local_index))
+            teacher = camera_to_record(camera, clip_index, local_index)
+            third_index = nearest_third_index(
+                cameras,
+                exclude={start_index, end_index},
+                position=camera_center(camera),
+            )
+            teacher["reference_indices"] = [
+                int(start_index), int(end_index), int(third_index)
+            ]
+            teacher["target_pose_type"] = "interpolated_colmap"
+            teacher["source_pair"] = [start.image_name, end.image_name]
+            teachers.append(teacher)
             uid += 1
         clips.append({
             "clip_index": clip_index,
@@ -159,6 +212,45 @@ def main():
             "pair_metrics": metrics,
             "teachers": teachers,
         })
+
+    if args.local_perturbations_per_view > 0:
+        scene_radius = max(float(ellipse["semi_a"]), float(ellipse["semi_b"]), 1e-8)
+        perturb_scale = args.local_perturbation_fraction * scene_radius
+        for camera_index, camera in enumerate(cameras):
+            c2w = _camera_c2w(camera)
+            right = c2w[:3, 0]
+            up = c2w[:3, 1]
+            directions = [right, -right, up, -up]
+            clip_index = len(clips)
+            left_index = max(0, camera_index - 1)
+            right_index = min(len(cameras) - 1, camera_index + 1)
+            references = sorted({camera_index, left_index, right_index})
+            while len(references) < min(3, len(cameras)):
+                references.append(nearest_third_index(cameras, references, camera_center(camera)))
+            teachers = []
+            for local_index, direction in enumerate(directions[:args.local_perturbations_per_view]):
+                name = f"es_local{camera_index:02d}_frame{local_index:02d}"
+                teacher = local_perturb_record(
+                    camera,
+                    delta=(perturb_scale * direction).astype(np.float32),
+                    uid=uid,
+                    name=name,
+                    clip_index=clip_index,
+                    frame_index=local_index,
+                )
+                teacher["reference_indices"] = [int(index) for index in references[:3]]
+                teacher["target_pose_type"] = "local_colmap_perturbation"
+                teacher["source_pair"] = [camera.image_name]
+                teachers.append(teacher)
+                uid += 1
+            clips.append({
+                "clip_index": clip_index,
+                "source_segment_index": -1,
+                "start_input": camera_index,
+                "end_input": camera_index,
+                "pair_metrics": {"local_perturbation": True},
+                "teachers": teachers,
+            })
 
     if len(clips) < args.min_compatible_pairs:
         raise RuntimeError(
