@@ -85,15 +85,14 @@ def log_validation(validation_dataloader, vae, image_encoder, feature_extractor,
     logger.info("Running {} validation... ".format(split))
 
     scheduler = DDIMScheduler.from_pretrained(args.pretrained_model_name_or_path, subfolder="scheduler")
-    pipeline = Zero1to3StableDiffusionPipeline.from_pretrained(
-        args.pretrained_model_name_or_path,
+    pipeline = Zero1to3StableDiffusionPipeline(
         vae=accelerator.unwrap_model(vae).eval(),
         image_encoder=accelerator.unwrap_model(image_encoder).eval(),
-        feature_extractor=feature_extractor,
         unet=accelerator.unwrap_model(unet).eval(),
         scheduler=scheduler,
         safety_checker=None,
-        torch_dtype=weight_dtype,
+        feature_extractor=feature_extractor,
+        requires_safety_checker=False,
     )
 
     pipeline = pipeline.to(accelerator.device)
@@ -1096,15 +1095,14 @@ def main(args):
                             ema_unet.store(unet.parameters())
                             ema_unet.copy_to(unet.parameters())
 
-                        pipeline = Zero1to3StableDiffusionPipeline.from_pretrained(
-                            args.pretrained_model_name_or_path,
+                        pipeline = Zero1to3StableDiffusionPipeline(
                             vae=accelerator.unwrap_model(vae),
                             image_encoder=accelerator.unwrap_model(image_encoder),
-                            feature_extractor=feature_extractor,
                             unet=accelerator.unwrap_model(unet),
                             scheduler=noise_scheduler,
                             safety_checker=None,
-                            torch_dtype=torch.float32,
+                            feature_extractor=feature_extractor,
+                            requires_safety_checker=False,
                         )
                         pipeline_save_path = os.path.join(args.output_dir, f"pipeline-{global_step}")
                         pipeline.save_pretrained(pipeline_save_path)
@@ -1183,15 +1181,14 @@ def main(args):
         if args.use_ema:
             ema_unet.copy_to(unet.parameters())
 
-        pipeline = Zero1to3StableDiffusionPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
+        pipeline = Zero1to3StableDiffusionPipeline(
             vae=accelerator.unwrap_model(vae),
             image_encoder=accelerator.unwrap_model(image_encoder),
-            feature_extractor=feature_extractor,
             unet=unet,
             scheduler=noise_scheduler,
             safety_checker=None,
-            torch_dtype=torch.float32,
+            feature_extractor=feature_extractor,
+            requires_safety_checker=False,
         )
         pipeline_save_path = os.path.join(args.output_dir, f"pipeline-{global_step}")
         pipeline.save_pretrained(pipeline_save_path)
