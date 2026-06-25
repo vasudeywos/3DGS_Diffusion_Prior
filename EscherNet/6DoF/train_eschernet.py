@@ -203,7 +203,10 @@ def log_validation(validation_dataloader, vae, image_encoder, feature_extractor,
     # after validation, set the pipeline back to training mode
     unet.train()
     vae.eval()
-    image_encoder.train()
+    if args.freeze_image_encoder:
+        image_encoder.eval()
+    else:
+        image_encoder.train()
 
     return image_logs
 
@@ -348,6 +351,14 @@ def parse_args(input_args=None):
         "--use_8bit_adam", action="store_true", help="Whether or not to use 8-bit Adam from bitsandbytes."
     )
     parser.add_argument(
+        "--adamw_foreach",
+        action="store_true",
+        help=(
+            "Use PyTorch foreach AdamW kernels. Disabled by default because foreach "
+            "can increase optimizer-step peak memory on 20GB GPUs."
+        ),
+    )
+    parser.add_argument(
         "--dataloader_num_workers",
         type=int,
         default=1,
@@ -474,6 +485,14 @@ def parse_args(input_args=None):
         type=float,
         default=0.35,
         help="Minimum timestep fraction used when --high_noise_shift is set.",
+    )
+    parser.add_argument(
+        "--freeze_image_encoder",
+        action="store_true",
+        help=(
+            "Freeze EscherNet's ConvNeXt image encoder and adapt only the diffusion "
+            "UNet. This substantially reduces memory and is recommended on 20GB GPUs."
+        ),
     )
     parser.add_argument("--use_ema", action="store_true", help="Whether to use EMA model.")
 
@@ -641,8 +660,12 @@ def main(args):
     vae.eval()
     vae.requires_grad_(False)
 
-    image_encoder.train()
-    image_encoder.requires_grad_(True)
+    if args.freeze_image_encoder:
+        image_encoder.eval()
+        image_encoder.requires_grad_(False)
+    else:
+        image_encoder.train()
+        image_encoder.requires_grad_(True)
 
     unet.requires_grad_(True)
     unet.train()
@@ -704,13 +727,19 @@ def main(args):
         optimizer_class = torch.optim.AdamW
 
 
-    optimizer = optimizer_class(
-        [{"params": unet.parameters(), "lr": args.learning_rate},
-         {"params": image_encoder.parameters(), "lr": args.learning_rate}],
-        betas=(args.adam_beta1, args.adam_beta2),
-        weight_decay=args.adam_weight_decay,
-        eps=args.adam_epsilon
-    )
+    optimizer_groups = [{"params": unet.parameters(), "lr": args.learning_rate}]
+    if not args.freeze_image_encoder:
+        optimizer_groups.append({"params": image_encoder.parameters(), "lr": args.learning_rate})
+
+    optimizer_kwargs = {
+        "betas": (args.adam_beta1, args.adam_beta2),
+        "weight_decay": args.adam_weight_decay,
+        "eps": args.adam_epsilon,
+    }
+    if optimizer_class is torch.optim.AdamW:
+        optimizer_kwargs["foreach"] = args.adamw_foreach
+
+    optimizer = optimizer_class(optimizer_groups, **optimizer_kwargs)
 
     # print model info, learnable parameters, non-learnable parameters, total parameters, model size, all in billion
     def print_model_info(model):
