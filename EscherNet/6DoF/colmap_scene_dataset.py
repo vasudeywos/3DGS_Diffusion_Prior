@@ -7,6 +7,7 @@ scene's camera centers so EscherNet sees a bounded pose distribution.
 """
 
 import os
+import importlib.util
 import sys
 from pathlib import Path
 
@@ -19,22 +20,28 @@ from torch.utils.data import Dataset
 IMAGE_EXTENSIONS = {".jpg", ".jpeg", ".png", ".JPG", ".JPEG", ".PNG"}
 
 
-def _add_scaffold_root(scaffold_root):
+def _load_scaffold_colmap_loader(scaffold_root):
     root = Path(scaffold_root).expanduser().resolve()
-    if str(root) not in sys.path:
-        sys.path.insert(0, str(root))
-    return root
+    loader_path = root / "scene" / "colmap_loader.py"
+    if not loader_path.is_file():
+        raise FileNotFoundError(f"Missing Scaffold-GS COLMAP loader: {loader_path}")
+    module_name = "_scaffold_colmap_loader"
+    if module_name in sys.modules:
+        return sys.modules[module_name]
+    spec = importlib.util.spec_from_file_location(module_name, loader_path)
+    module = importlib.util.module_from_spec(spec)
+    sys.modules[module_name] = module
+    spec.loader.exec_module(module)
+    return module
 
 
 def _load_colmap(scene_dir, images_name, scaffold_root):
-    _add_scaffold_root(scaffold_root)
-    from scene.colmap_loader import (
-        qvec2rotmat,
-        read_extrinsics_binary,
-        read_extrinsics_text,
-        read_intrinsics_binary,
-        read_intrinsics_text,
-    )
+    colmap_loader = _load_scaffold_colmap_loader(scaffold_root)
+    qvec2rotmat = colmap_loader.qvec2rotmat
+    read_extrinsics_binary = colmap_loader.read_extrinsics_binary
+    read_extrinsics_text = colmap_loader.read_extrinsics_text
+    read_intrinsics_binary = colmap_loader.read_intrinsics_binary
+    read_intrinsics_text = colmap_loader.read_intrinsics_text
 
     sparse = Path(scene_dir) / "sparse" / "0"
     try:
